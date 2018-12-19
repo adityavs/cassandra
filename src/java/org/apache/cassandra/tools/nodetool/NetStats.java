@@ -17,8 +17,8 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import io.airlift.command.Command;
-import io.airlift.command.Option;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
 
 import java.util.Set;
 
@@ -35,7 +35,7 @@ public class NetStats extends NodeToolCmd
 {
     @Option(title = "human_readable",
             name = {"-H", "--human-readable"},
-            description = "Display bytes in human readable form, i.e. KB, MB, GB, TB")
+            description = "Display bytes in human readable form, i.e. KiB, MiB, GiB, TiB")
     private boolean humanReadable = false;
 
     @Override
@@ -47,14 +47,14 @@ public class NetStats extends NodeToolCmd
             System.out.println("Not sending any streams.");
         for (StreamState status : statuses)
         {
-            System.out.printf("%s %s%n", status.description, status.planId.toString());
+            System.out.printf("%s %s%n", status.streamOperation.getDescription(), status.planId.toString());
             for (SessionInfo info : status.sessions)
             {
-                System.out.printf("    %s", info.peer.toString());
+                System.out.printf("    %s", info.peer.toString(printPort));
                 // print private IP when it is used
                 if (!info.peer.equals(info.connecting))
                 {
-                    System.out.printf(" (using %s)", info.connecting.toString());
+                    System.out.printf(" (using %s)", info.connecting.toString(printPort));
                 }
                 System.out.printf("%n");
                 if (!info.receivingSummaries.isEmpty())
@@ -65,7 +65,7 @@ public class NetStats extends NodeToolCmd
                         System.out.printf("        Receiving %d files, %d bytes total. Already received %d files, %d bytes total%n", info.getTotalFilesToReceive(), info.getTotalSizeToReceive(), info.getTotalFilesReceived(), info.getTotalSizeReceived());
                     for (ProgressInfo progress : info.getReceivingFiles())
                     {
-                        System.out.printf("            %s%n", progress.toString());
+                        System.out.printf("            %s%n", progress.toString(printPort));
                     }
                 }
                 if (!info.sendingSummaries.isEmpty())
@@ -76,7 +76,7 @@ public class NetStats extends NodeToolCmd
                         System.out.printf("        Sending %d files, %d bytes total. Already sent %d files, %d bytes total%n", info.getTotalFilesToSend(), info.getTotalSizeToSend(), info.getTotalFilesSent(), info.getTotalSizeSent());
                     for (ProgressInfo progress : info.getSendingFiles())
                     {
-                        System.out.printf("            %s%n", progress.toString());
+                        System.out.printf("            %s%n", progress.toString(printPort));
                     }
                 }
             }
@@ -90,10 +90,12 @@ public class NetStats extends NodeToolCmd
             System.out.printf("%-25s", "Pool Name");
             System.out.printf("%10s", "Active");
             System.out.printf("%10s", "Pending");
-            System.out.printf("%15s%n", "Completed");
+            System.out.printf("%15s", "Completed");
+            System.out.printf("%10s%n", "Dropped");
 
             int pending;
             long completed;
+            long dropped;
 
             pending = 0;
             for (int n : ms.getLargeMessagePendingTasks().values())
@@ -101,7 +103,10 @@ public class NetStats extends NodeToolCmd
             completed = 0;
             for (long n : ms.getLargeMessageCompletedTasks().values())
                 completed += n;
-            System.out.printf("%-25s%10s%10s%15s%n", "Large messages", "n/a", pending, completed);
+            dropped = 0;
+            for (long n : ms.getLargeMessageDroppedTasks().values())
+                dropped += n;
+            System.out.printf("%-25s%10s%10s%15s%10s%n", "Large messages", "n/a", pending, completed, dropped);
 
             pending = 0;
             for (int n : ms.getSmallMessagePendingTasks().values())
@@ -109,7 +114,10 @@ public class NetStats extends NodeToolCmd
             completed = 0;
             for (long n : ms.getSmallMessageCompletedTasks().values())
                 completed += n;
-            System.out.printf("%-25s%10s%10s%15s%n", "Small messages", "n/a", pending, completed);
+            dropped = 0;
+            for (long n : ms.getSmallMessageDroppedTasks().values())
+                dropped += n;
+            System.out.printf("%-25s%10s%10s%15s%10s%n", "Small messages", "n/a", pending, completed, dropped);
 
             pending = 0;
             for (int n : ms.getGossipMessagePendingTasks().values())
@@ -117,7 +125,10 @@ public class NetStats extends NodeToolCmd
             completed = 0;
             for (long n : ms.getGossipMessageCompletedTasks().values())
                 completed += n;
-            System.out.printf("%-25s%10s%10s%15s%n", "Gossip messages", "n/a", pending, completed);
+            dropped = 0;
+            for (long n : ms.getGossipMessageDroppedTasks().values())
+                dropped += n;
+            System.out.printf("%-25s%10s%10s%15s%10s%n", "Gossip messages", "n/a", pending, completed, dropped);
         }
     }
 }

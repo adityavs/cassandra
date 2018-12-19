@@ -1,6 +1,6 @@
 package org.apache.cassandra.triggers;
 /*
- * 
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -8,16 +8,16 @@ package org.apache.cassandra.triggers;
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
  * KIND, either express or implied.  See the License for the
  * specific language governing permissions and limitations
  * under the License.
- * 
+ *
  */
 
 
@@ -34,6 +34,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.io.Files;
+
+import org.apache.cassandra.io.util.FileUtils;
 
 /**
  * Custom class loader will load the classes from the class path, CCL will load
@@ -67,14 +69,16 @@ public class CustomClassLoader extends URLClassLoader
     {
         if (dir == null || !dir.exists())
             return;
-        FilenameFilter filter = new FilenameFilter() {
-            public boolean accept(File dir, String name) {
+        FilenameFilter filter = new FilenameFilter()
+        {
+            public boolean accept(File dir, String name)
+            {
                 return name.endsWith(".jar");
             }
         };
         for (File inputJar : dir.listFiles(filter))
         {
-            File lib = new File(System.getProperty("java.io.tmpdir"), "lib");
+            File lib = new File(FileUtils.getTempDir(), "lib");
             if (!lib.exists())
             {
                 lib.mkdir();
@@ -82,7 +86,7 @@ public class CustomClassLoader extends URLClassLoader
             }
             try
             {
-                File out = File.createTempFile("cassandra-", ".jar", lib);
+                File out = FileUtils.createTempFile("cassandra-", ".jar", lib);
                 out.deleteOnExit();
                 logger.info("Loading new jar {}", inputJar.getAbsolutePath());
                 Files.copy(inputJar, out);
@@ -112,7 +116,7 @@ public class CustomClassLoader extends URLClassLoader
         }
         catch (ClassNotFoundException ex)
         {
-            logger.debug("Class not found using parent class loader,", ex);
+            logger.trace("Class not found using parent class loader,", ex);
             // Don't throw the exception here, try triggers directory.
         }
         Class<?> clazz = this.findClass(name);

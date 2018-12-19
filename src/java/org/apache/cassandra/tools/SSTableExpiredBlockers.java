@@ -17,23 +17,20 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.IOException;
 import java.io.PrintStream;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-import com.google.common.base.Throwables;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -48,7 +45,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
  */
 public class SSTableExpiredBlockers
 {
-    public static void main(String[] args) throws IOException
+    public static void main(String[] args)
     {
         PrintStream out = System.out;
         if (args.length < 2)
@@ -56,15 +53,14 @@ public class SSTableExpiredBlockers
             out.println("Usage: sstableexpiredblockers <keyspace> <table>");
             System.exit(1);
         }
+
+        Util.initDatabaseDescriptor();
+
         String keyspace = args[args.length - 2];
         String columnfamily = args[args.length - 1];
         Schema.instance.loadFromDisk(false);
 
-        CFMetaData metadata = Schema.instance.getCFMetaData(keyspace, columnfamily);
-        if (metadata == null)
-            throw new IllegalArgumentException(String.format("Unknown keyspace/table %s.%s",
-                    keyspace,
-                    columnfamily));
+        TableMetadata metadata = Schema.instance.validateTable(keyspace, columnfamily);
 
         Keyspace ks = Keyspace.openWithoutSSTables(keyspace);
         ColumnFamilyStore cfs = ks.getColumnFamilyStore(columnfamily);
@@ -81,8 +77,7 @@ public class SSTableExpiredBlockers
                 }
                 catch (Throwable t)
                 {
-                    out.println("Couldn't open sstable: " + sstable.getKey().filenameFor(Component.DATA));
-                    Throwables.propagate(t);
+                    out.println("Couldn't open sstable: " + sstable.getKey().filenameFor(Component.DATA)+" ("+t.getMessage()+")");
                 }
             }
         }

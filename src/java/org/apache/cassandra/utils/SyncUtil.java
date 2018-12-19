@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.utils;
 
 import java.io.*;
@@ -8,8 +28,11 @@ import java.nio.channels.FileChannel;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.cassandra.config.Config;
+import org.apache.cassandra.service.CassandraDaemon;
 
 import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /*
  * A wrapper around various mechanisms for syncing files that makes it possible it intercept
@@ -18,11 +41,13 @@ import com.google.common.base.Preconditions;
  */
 public class SyncUtil
 {
-    public static boolean SKIP_SYNC = Boolean.getBoolean(Config.PROPERTY_PREFIX + "skip_sync");
+    public static final boolean SKIP_SYNC;
 
     private static final Field mbbFDField;
     private static final Field fdClosedField;
     private static final Field fdUseCountField;
+
+    private static final Logger logger = LoggerFactory.getLogger(SyncUtil.class);
 
     static
     {
@@ -60,6 +85,15 @@ public class SyncUtil
         {
         }
         fdUseCountField = fdUseCountTemp;
+
+        //If skipping syncing is requested by any means then skip them.
+        boolean skipSyncProperty = Boolean.getBoolean(Config.PROPERTY_PREFIX + "skip_sync");
+        boolean skipSyncEnv = Boolean.valueOf(System.getenv().getOrDefault("CASSANDRA_SKIP_SYNC", "false"));
+        SKIP_SYNC = skipSyncProperty || skipSyncEnv;
+        if (SKIP_SYNC)
+        {
+            logger.info("Skip fsync enabled due to property {} and environment {}", skipSyncProperty, skipSyncEnv);
+        }
     }
 
     public static MappedByteBuffer force(MappedByteBuffer buf)
@@ -156,7 +190,7 @@ public class SyncUtil
         if (SKIP_SYNC)
             return;
         else
-            CLibrary.trySync(fd);
+            NativeLibrary.trySync(fd);
     }
 
     public static void trySyncDir(File dir)
@@ -164,14 +198,14 @@ public class SyncUtil
         if (SKIP_SYNC)
             return;
 
-        int directoryFD = CLibrary.tryOpenDirectory(dir.getPath());
+        int directoryFD = NativeLibrary.tryOpenDirectory(dir.getPath());
         try
         {
             trySync(directoryFD);
         }
         finally
         {
-            CLibrary.tryCloseFD(directoryFD);
+            NativeLibrary.tryCloseFD(directoryFD);
         }
     }
 }

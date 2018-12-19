@@ -21,7 +21,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
@@ -34,10 +33,11 @@ public class CounterMutationVerbHandler implements IVerbHandler<CounterMutation>
 
     public void doVerb(final MessageIn<CounterMutation> message, final int id)
     {
+        long queryStartNanoTime = System.nanoTime();
         final CounterMutation cm = message.payload;
-        logger.debug("Applying forwarded {}", cm);
+        logger.trace("Applying forwarded {}", cm);
 
-        String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+        String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
         // We should not wait for the result of the write in this thread,
         // otherwise we could have a distributed deadlock between replicas
         // running this VerbHandler (see #4578).
@@ -49,8 +49,8 @@ public class CounterMutationVerbHandler implements IVerbHandler<CounterMutation>
         {
             public void run()
             {
-                MessagingService.instance().sendReply(new WriteResponse().createMessage(), id, message.from);
+                MessagingService.instance().sendReply(WriteResponse.createMessage(), id, message.from);
             }
-        });
+        }, queryStartNanoTime);
     }
 }

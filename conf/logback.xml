@@ -17,30 +17,70 @@
  under the License.
 -->
 
-<configuration scan="true">
-  <jmxConfigurator />
-  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-    <file>${cassandra.logdir}/system.log</file>
-    <rollingPolicy class="ch.qos.logback.core.rolling.FixedWindowRollingPolicy">
-      <fileNamePattern>${cassandra.logdir}/system.log.%i.zip</fileNamePattern>
-      <minIndex>1</minIndex>
-      <maxIndex>20</maxIndex>
-    </rollingPolicy>
+<!--
+In order to disable debug.log, comment-out the ASYNCDEBUGLOG
+appender reference in the root level section below.
+-->
 
-    <triggeringPolicy class="ch.qos.logback.core.rolling.SizeBasedTriggeringPolicy">
-      <maxFileSize>20MB</maxFileSize>
-    </triggeringPolicy>
+<configuration scan="true" scanPeriod="60 seconds">
+  <jmxConfigurator />
+
+  <!-- No shutdown hook; we run it ourselves in StorageService after shutdown -->
+
+  <!-- SYSTEMLOG rolling file appender to system.log (INFO level) -->
+
+  <appender name="SYSTEMLOG" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+      <level>INFO</level>
+    </filter>
+    <file>${cassandra.logdir}/system.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <!-- rollover daily -->
+      <fileNamePattern>${cassandra.logdir}/system.log.%d{yyyy-MM-dd}.%i.zip</fileNamePattern>
+      <!-- each file should be at most 50MB, keep 7 days worth of history, but at most 5GB -->
+      <maxFileSize>50MB</maxFileSize>
+      <maxHistory>7</maxHistory>
+      <totalSizeCap>5GB</totalSizeCap>
+    </rollingPolicy>
     <encoder>
       <pattern>%-5level [%thread] %date{ISO8601} %F:%L - %msg%n</pattern>
-      <!-- old-style log format
-      <pattern>%5level [%thread] %date{ISO8601} %F (line %L) %msg%n</pattern>
-      -->
     </encoder>
   </appender>
-  
-  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+
+  <!-- DEBUGLOG rolling file appender to debug.log (all levels) -->
+
+  <appender name="DEBUGLOG" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${cassandra.logdir}/debug.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <!-- rollover daily -->
+      <fileNamePattern>${cassandra.logdir}/debug.log.%d{yyyy-MM-dd}.%i.zip</fileNamePattern>
+      <!-- each file should be at most 50MB, keep 7 days worth of history, but at most 5GB -->
+      <maxFileSize>50MB</maxFileSize>
+      <maxHistory>7</maxHistory>
+      <totalSizeCap>5GB</totalSizeCap>
+    </rollingPolicy>
     <encoder>
-      <pattern>%-5level %date{HH:mm:ss,SSS} %msg%n</pattern>
+      <pattern>%-5level [%thread] %date{ISO8601} %F:%L - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- ASYNCLOG assynchronous appender to debug.log (all levels) -->
+
+  <appender name="ASYNCDEBUGLOG" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>1024</queueSize>
+    <discardingThreshold>0</discardingThreshold>
+    <includeCallerData>true</includeCallerData>
+    <appender-ref ref="DEBUGLOG" />
+  </appender>
+
+  <!-- STDOUT console appender to stdout (INFO level) -->
+
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+      <level>INFO</level>
+    </filter>
+    <encoder>
+      <pattern>%-5level [%thread] %date{ISO8601} %F:%L - %msg%n</pattern>
     </encoder>
   </appender>
 
@@ -49,12 +89,13 @@
    -->
 
   <root level="INFO">
-    <appender-ref ref="FILE" />
+    <appender-ref ref="SYSTEMLOG" />
     <appender-ref ref="STDOUT" />
+    <appender-ref ref="ASYNCDEBUGLOG" /> <!-- Comment this line to disable debug.log -->
     <!--
     <appender-ref ref="LogbackMetrics" />
     -->
   </root>
-  
-  <logger name="com.thinkaurelius.thrift" level="ERROR"/>
+
+  <logger name="org.apache.cassandra" level="DEBUG"/>
 </configuration>

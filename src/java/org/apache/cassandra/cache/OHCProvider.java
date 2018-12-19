@@ -20,14 +20,15 @@ package org.apache.cassandra.cache;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
-import java.util.UUID;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.partitions.CachedPartition;
 import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
-import org.apache.cassandra.io.util.NIODataInputStream;
+import org.apache.cassandra.io.util.RebufferingInputStream;
+import org.apache.cassandra.schema.TableId;
 import org.caffinitas.ohc.OHCache;
 import org.caffinitas.ohc.OHCacheBuilder;
 
@@ -95,7 +96,7 @@ public class OHCProvider implements CacheProvider<RowCacheKey, IRowCacheEntry>
 
         public long weightedSize()
         {
-            return ohCache.size();
+            return ohCache.memUsed();
         }
 
         public void clear()
@@ -124,24 +125,45 @@ public class OHCProvider implements CacheProvider<RowCacheKey, IRowCacheEntry>
         private static KeySerializer instance = new KeySerializer();
         public void serialize(RowCacheKey rowCacheKey, ByteBuffer buf)
         {
-            buf.putLong(rowCacheKey.cfId.getMostSignificantBits());
-            buf.putLong(rowCacheKey.cfId.getLeastSignificantBits());
+            try (DataOutputBuffer dataOutput = new DataOutputBufferFixed(buf))
+            {
+                rowCacheKey.tableId.serialize(dataOutput);
+                dataOutput.writeUTF(rowCacheKey.indexName != null ? rowCacheKey.indexName : "");
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
             buf.putInt(rowCacheKey.key.length);
             buf.put(rowCacheKey.key);
         }
 
         public RowCacheKey deserialize(ByteBuffer buf)
         {
-            long msb = buf.getLong();
-            long lsb = buf.getLong();
+            TableId tableId = null;
+            String indexName = null;
+            try (DataInputBuffer dataInput = new DataInputBuffer(buf, false))
+            {
+                tableId = TableId.deserialize(dataInput);
+                indexName = dataInput.readUTF();
+                if (indexName.isEmpty())
+                    indexName = null;
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
             byte[] key = new byte[buf.getInt()];
             buf.get(key);
-            return new RowCacheKey(new UUID(msb, lsb), key);
+            return new RowCacheKey(tableId, indexName, key);
         }
 
         public int serializedSize(RowCacheKey rowCacheKey)
         {
-            return 20 + rowCacheKey.key.length;
+            return rowCacheKey.tableId.serializedSize()
+                   + TypeSizes.sizeof(rowCacheKey.indexName != null ? rowCacheKey.indexName : "")
+                   + 4
+                   + rowCacheKey.key.length;
         }
     }
 
@@ -151,8 +173,7 @@ public class OHCProvider implements CacheProvider<RowCacheKey, IRowCacheEntry>
         public void serialize(IRowCacheEntry entry, ByteBuffer buf)
         {
             assert entry != null; // unlike CFS we don't support nulls, since there is no need for that in the cache
-            DataOutputBufferFixed out = new DataOutputBufferFixed(buf);
-            try
+            try (DataOutputBufferFixed out = new DataOutputBufferFixed(buf))
             {
                 boolean isSentinel = entry instanceof RowCacheSentinel;
                 out.writeBoolean(isSentinel);
@@ -172,7 +193,7 @@ public class OHCProvider implements CacheProvider<RowCacheKey, IRowCacheEntry>
         {
             try
             {
-                NIODataInputStream in = new DataInputBuffer(buf, false);
+                RebufferingInputStream in = new DataInputBuffer(buf, false);
                 boolean isSentinel = in.readBoolean();
                 if (isSentinel)
                     return new RowCacheSentinel(in.readLong());

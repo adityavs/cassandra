@@ -18,125 +18,188 @@
 
 package org.apache.cassandra.schema;
 
-import java.util.Collections;
-import java.util.Map;
-import java.util.Set;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
-
+import com.google.common.collect.Maps;
 import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.db.index.SecondaryIndex;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.UnknownIndexException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.UUIDSerializer;
 
 /**
  * An immutable representation of secondary index metadata.
  */
 public final class IndexMetadata
 {
-    public enum IndexType
+    private static final Logger logger = LoggerFactory.getLogger(IndexMetadata.class);
+
+    private static final Pattern PATTERN_NON_WORD_CHAR = Pattern.compile("\\W");
+    private static final Pattern PATTERN_WORD_CHARS = Pattern.compile("\\w+");
+
+
+    public static final Serializer serializer = new Serializer();
+
+    public enum Kind
     {
         KEYS, CUSTOM, COMPOSITES
     }
 
-    public enum TargetType
-    {
-        COLUMN, ROW
-    }
-
+    // UUID for serialization. This is a deterministic UUID generated from the index name
+    // Both the id and name are guaranteed unique per keyspace.
+    public final UUID id;
     public final String name;
-    public final IndexType indexType;
-    public final TargetType targetType;
+    public final Kind kind;
     public final Map<String, String> options;
-    public final Set<ColumnIdentifier> columns;
 
     private IndexMetadata(String name,
                           Map<String, String> options,
-                          IndexType indexType,
-                          TargetType targetType,
-                          Set<ColumnIdentifier> columns)
+                          Kind kind)
     {
+        this.id = UUID.nameUUIDFromBytes(name.getBytes());
         this.name = name;
         this.options = options == null ? ImmutableMap.of() : ImmutableMap.copyOf(options);
-        this.indexType = indexType;
-        this.targetType = targetType;
-        this.columns = columns == null ? ImmutableSet.of() : ImmutableSet.copyOf(columns);
+        this.kind = kind;
     }
 
-    public static IndexMetadata legacyIndex(ColumnIdentifier column,
-                                              String name,
-                                              IndexType type,
-                                              Map<String, String> options)
+    public static IndexMetadata fromSchemaMetadata(String name, Kind kind, Map<String, String> options)
     {
-        return new IndexMetadata(name, options, type, TargetType.COLUMN, Collections.singleton(column));
+        return new IndexMetadata(name, options, kind);
     }
 
-    public static IndexMetadata legacyIndex(ColumnDefinition column,
-                                              String name,
-                                              IndexType type,
-                                              Map<String, String> options)
+    public static IndexMetadata fromIndexTargets(List<IndexTarget> targets,
+                                                 String name,
+                                                 Kind kind,
+                                                 Map<String, String> options)
     {
-        return legacyIndex(column.name, name, type, options);
+        Map<String, String> newOptions = new HashMap<>(options);
+        newOptions.put(IndexTarget.TARGET_OPTION_NAME, targets.stream()
+                                                              .map(target -> target.asCqlString())
+                                                              .collect(Collectors.joining(", ")));
+        return new IndexMetadata(name, newOptions, kind);
     }
 
     public static boolean isNameValid(String name)
     {
-        return name != null && !name.isEmpty() && name.matches("\\w+");
+        return name != null && !name.isEmpty() && PATTERN_WORD_CHARS.matcher(name).matches();
     }
 
-    // these will go away as part of #9459 as we enable real per-row indexes
-    public static String getDefaultIndexName(String cfName, ColumnIdentifier columnName)
+    public static String generateDefaultIndexName(String table, ColumnIdentifier column)
     {
-        return (cfName + "_" + columnName + "_idx").replaceAll("\\W", "");
+        return PATTERN_NON_WORD_CHAR.matcher(table + "_" + column.toString() + "_idx").replaceAll("");
     }
 
-    public void validate()
+    public static String generateDefaultIndexName(String table)
+    {
+        return PATTERN_NON_WORD_CHAR.matcher(table + "_" + "idx").replaceAll("");
+    }
+
+    public void validate(TableMetadata table)
     {
         if (!isNameValid(name))
             throw new ConfigurationException("Illegal index name " + name);
 
-        if (indexType == null)
-            throw new ConfigurationException("Index type is null for index " + name);
+        if (kind == null)
+            throw new ConfigurationException("Index kind is null for index " + name);
 
-        if (targetType == null)
-            throw new ConfigurationException("Target type is null for index " + name);
-
-        if (indexType == IndexMetadata.IndexType.CUSTOM)
-            if (options == null || !options.containsKey(SecondaryIndex.CUSTOM_INDEX_OPTION_NAME))
+        if (kind == Kind.CUSTOM)
+        {
+            if (options == null || !options.containsKey(IndexTarget.CUSTOM_INDEX_OPTION_NAME))
                 throw new ConfigurationException(String.format("Required option missing for index %s : %s",
-                                                               name, SecondaryIndex.CUSTOM_INDEX_OPTION_NAME));
+                                                               name, IndexTarget.CUSTOM_INDEX_OPTION_NAME));
+            String className = options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME);
+            Class<Index> indexerClass = FBUtilities.classForName(className, "custom indexer");
+            if (!Index.class.isAssignableFrom(indexerClass))
+                throw new ConfigurationException(String.format("Specified Indexer class (%s) does not implement the Indexer interface", className));
+            validateCustomIndexOptions(table, indexerClass, options);
+        }
     }
 
-    public ColumnDefinition indexedColumn(CFMetaData cfm)
+    private void validateCustomIndexOptions(TableMetadata table, Class<? extends Index> indexerClass, Map<String, String> options)
     {
-       return cfm.getColumnDefinition(columns.iterator().next());
+        try
+        {
+            Map<String, String> filteredOptions = Maps.filterKeys(options, key -> !key.equals(IndexTarget.CUSTOM_INDEX_OPTION_NAME));
+
+            if (filteredOptions.isEmpty())
+                return;
+
+            Map<?, ?> unknownOptions;
+            try
+            {
+                unknownOptions = (Map) indexerClass.getMethod("validateOptions", Map.class, TableMetadata.class).invoke(null, filteredOptions, table);
+            }
+            catch (NoSuchMethodException e)
+            {
+                unknownOptions = (Map) indexerClass.getMethod("validateOptions", Map.class).invoke(null, filteredOptions);
+            }
+
+            if (!unknownOptions.isEmpty())
+                throw new ConfigurationException(String.format("Properties specified %s are not understood by %s", unknownOptions.keySet(), indexerClass.getSimpleName()));
+        }
+        catch (NoSuchMethodException e)
+        {
+            logger.info("Indexer {} does not have a static validateOptions method. Validation ignored",
+                        indexerClass.getName());
+        }
+        catch (InvocationTargetException e)
+        {
+            if (e.getTargetException() instanceof ConfigurationException)
+                throw (ConfigurationException) e.getTargetException();
+            throw new ConfigurationException("Failed to validate custom indexer options: " + options);
+        }
+        catch (ConfigurationException e)
+        {
+            throw e;
+        }
+        catch (Exception e)
+        {
+            throw new ConfigurationException("Failed to validate custom indexer options: " + options);
+        }
     }
 
     public boolean isCustom()
     {
-        return indexType == IndexType.CUSTOM;
+        return kind == Kind.CUSTOM;
     }
 
     public boolean isKeys()
     {
-        return indexType == IndexType.KEYS;
+        return kind == Kind.KEYS;
     }
 
     public boolean isComposites()
     {
-        return indexType == IndexType.COMPOSITES;
+        return kind == Kind.COMPOSITES;
     }
 
+    @Override
     public int hashCode()
     {
-        return Objects.hashCode(name, indexType, targetType, options, columns);
+        return Objects.hashCode(id, name, kind, options);
     }
 
+    public boolean equalsWithoutName(IndexMetadata other)
+    {
+        return Objects.equal(kind, other.kind)
+               && Objects.equal(options, other.options);
+    }
+
+    @Override
     public boolean equals(Object obj)
     {
         if (obj == this)
@@ -145,23 +208,43 @@ public final class IndexMetadata
         if (!(obj instanceof IndexMetadata))
             return false;
 
-        IndexMetadata other = (IndexMetadata)obj;
+        IndexMetadata other = (IndexMetadata) obj;
 
-        return Objects.equal(name, other.name)
-            && Objects.equal(indexType, other.indexType)
-            && Objects.equal(targetType, other.targetType)
-            && Objects.equal(options, other.options)
-            && Objects.equal(columns, other.columns);
+        return Objects.equal(id, other.id) && Objects.equal(name, other.name) && equalsWithoutName(other);
     }
 
+    @Override
     public String toString()
     {
         return new ToStringBuilder(this)
-            .append("name", name)
-            .append("indexType", indexType)
-            .append("targetType", targetType)
-            .append("columns", columns)
-            .append("options", options)
-            .build();
+               .append("id", id.toString())
+               .append("name", name)
+               .append("kind", kind)
+               .append("options", options)
+               .build();
+    }
+
+    public String toCQLString()
+    {
+        return ColumnIdentifier.maybeQuote(name);
+    }
+
+    public static class Serializer
+    {
+        public void serialize(IndexMetadata metadata, DataOutputPlus out, int version) throws IOException
+        {
+            UUIDSerializer.serializer.serialize(metadata.id, out, version);
+        }
+
+        public IndexMetadata deserialize(DataInputPlus in, int version, TableMetadata table) throws IOException
+        {
+            UUID id = UUIDSerializer.serializer.deserialize(in, version);
+            return table.indexes.get(id).orElseThrow(() -> new UnknownIndexException(table, id));
+        }
+
+        public long serializedSize(IndexMetadata metadata, int version)
+        {
+            return UUIDSerializer.serializer.serializedSize(metadata.id, version);
+        }
     }
 }

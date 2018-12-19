@@ -35,8 +35,8 @@ import java.util.UUID;
 import net.nicoulaj.compilecommand.annotations.Inline;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileUtils;
 
 /**
@@ -284,6 +284,31 @@ public class ByteBufferUtil
         return length;
     }
 
+    public static void writeZeroes(ByteBuffer dest, int count)
+    {
+        if (count >= 8)
+        {
+            // align
+            while ((dest.position() & 0x7) != 0)
+            {
+                dest.put((byte) 0);
+                --count;
+            }
+        }
+        // write aligned longs
+        while (count >= 8)
+        {
+            dest.putLong(0L);
+            count -= 8;
+        }
+        // finish up
+        while (count > 0)
+        {
+            dest.put((byte) 0);
+            --count;
+        }
+    }
+
     public static void writeWithLength(ByteBuffer bytes, DataOutputPlus out) throws IOException
     {
         out.writeInt(bytes.remaining());
@@ -292,7 +317,7 @@ public class ByteBufferUtil
 
     public static void writeWithVIntLength(ByteBuffer bytes, DataOutputPlus out) throws IOException
     {
-        out.writeVInt(bytes.remaining());
+        out.writeUnsignedVInt(bytes.remaining());
         out.write(bytes);
     }
 
@@ -305,7 +330,8 @@ public class ByteBufferUtil
     public static void writeWithShortLength(ByteBuffer buffer, DataOutputPlus out) throws IOException
     {
         int length = buffer.remaining();
-        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT : length;
+        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT
+            : String.format("Attempted serializing to buffer exceeded maximum of %s bytes: %s", FBUtilities.MAX_UNSIGNED_SHORT, length);
         out.writeShort(length);
         out.write(buffer);
     }
@@ -313,7 +339,8 @@ public class ByteBufferUtil
     public static void writeWithShortLength(byte[] buffer, DataOutput out) throws IOException
     {
         int length = buffer.length;
-        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT : length;
+        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT
+            : String.format("Attempted serializing to buffer exceeded maximum of %s bytes: %s", FBUtilities.MAX_UNSIGNED_SHORT, length);
         out.writeShort(length);
         out.write(buffer);
     }
@@ -331,7 +358,7 @@ public class ByteBufferUtil
 
     public static ByteBuffer readWithVIntLength(DataInputPlus in) throws IOException
     {
-        int length = (int)in.readVInt();
+        int length = (int)in.readUnsignedVInt();
         if (length < 0)
             throw new IOException("Corrupt (negative) value length encountered");
 
@@ -347,16 +374,16 @@ public class ByteBufferUtil
     public static int serializedSizeWithVIntLength(ByteBuffer buffer)
     {
         int size = buffer.remaining();
-        return TypeSizes.sizeofVInt(size) + size;
+        return TypeSizes.sizeofUnsignedVInt(size) + size;
     }
 
     public static void skipWithVIntLength(DataInputPlus in) throws IOException
     {
-        int length = (int)in.readVInt();
+        int length = (int)in.readUnsignedVInt();
         if (length < 0)
             throw new IOException("Corrupt (negative) value length encountered");
 
-        FileUtils.skipBytesFully(in, length);
+        in.skipBytesFully(length);
     }
 
     /* @return An unsigned short in an integer. */
@@ -383,22 +410,18 @@ public class ByteBufferUtil
 
     /**
      * @param in data input
-     * @return null
      * @throws IOException if an I/O error occurs.
      */
-    public static void skipShortLength(DataInput in) throws IOException
+    public static void skipShortLength(DataInputPlus in) throws IOException
     {
         int skip = readShortLength(in);
-        FileUtils.skipBytesFully(in, skip);
+        in.skipBytesFully(skip);
     }
 
     public static ByteBuffer read(DataInput in, int length) throws IOException
     {
         if (length == 0)
             return EMPTY_BYTE_BUFFER;
-
-        if (in instanceof FileDataInput)
-            return ((FileDataInput) in).readBytes(length);
 
         byte[] buff = new byte[length];
         in.readFully(buff);
@@ -411,6 +434,15 @@ public class ByteBufferUtil
         byte[] bytes = new byte[length];
         in.readFully(bytes);
         return bytes;
+    }
+
+    public static byte[] readBytesWithLength(DataInput in) throws IOException
+    {
+        int length = in.readInt();
+        if (length < 0)
+            throw new IOException("Corrupt (negative) value length encountered");
+
+        return readBytes(in, length);
     }
 
     /**
@@ -437,6 +469,18 @@ public class ByteBufferUtil
         return bytes.getShort(bytes.position());
     }
 
+    /**
+     * Convert a byte buffer to a short.
+     * Does not change the byte buffer position.
+     *
+     * @param bytes byte buffer to convert to byte
+     * @return byte representation of the byte buffer
+     */
+    public static byte toByte(ByteBuffer bytes)
+    {
+        return bytes.get(bytes.position());
+    }
+
     public static long toLong(ByteBuffer bytes)
     {
         return bytes.getLong(bytes.position());
@@ -450,6 +494,37 @@ public class ByteBufferUtil
     public static double toDouble(ByteBuffer bytes)
     {
         return bytes.getDouble(bytes.position());
+    }
+
+    public static ByteBuffer objectToBytes(Object obj)
+    {
+        if (obj instanceof Integer)
+            return ByteBufferUtil.bytes((int) obj);
+        else if (obj instanceof Byte)
+            return ByteBufferUtil.bytes((byte) obj);
+        else if (obj instanceof Short)
+            return ByteBufferUtil.bytes((short) obj);
+        else if (obj instanceof Long)
+            return ByteBufferUtil.bytes((long) obj);
+        else if (obj instanceof Float)
+            return ByteBufferUtil.bytes((float) obj);
+        else if (obj instanceof Double)
+            return ByteBufferUtil.bytes((double) obj);
+        else if (obj instanceof UUID)
+            return ByteBufferUtil.bytes((UUID) obj);
+        else if (obj instanceof InetAddress)
+            return ByteBufferUtil.bytes((InetAddress) obj);
+        else if (obj instanceof String)
+            return ByteBufferUtil.bytes((String) obj);
+        else
+            throw new IllegalArgumentException(String.format("Cannot convert value %s of type %s",
+                                                             obj,
+                                                             obj.getClass()));
+    }
+
+    public static ByteBuffer bytes(byte b)
+    {
+        return ByteBuffer.allocate(1).put(0, b);
     }
 
     public static ByteBuffer bytes(short s)
@@ -516,7 +591,8 @@ public class ByteBufferUtil
      */
     public static String bytesToHex(ByteBuffer bytes)
     {
-        if (bytes.hasArray()) {
+        if (bytes.hasArray())
+        {
             return Hex.bytesToHex(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
         }
 
@@ -630,4 +706,120 @@ public class ByteBufferUtil
         return readBytes(bb, length);
     }
 
+    /**
+     * Ensure {@code buf} is large enough for {@code outputLength}. If not, it is cleaned up and a new buffer is allocated;
+     * else; buffer has it's position/limit set appropriately.
+     *
+     * @param buf buffer to test the size of; may be null, in which case, a new buffer is allocated.
+     * @param outputLength the minimum target size of the buffer
+     * @param allowBufferResize true if resizing (reallocating) the buffer is allowed
+     * @return {@code buf} if it was large enough, else a newly allocated buffer.
+     */
+    public static ByteBuffer ensureCapacity(ByteBuffer buf, int outputLength, boolean allowBufferResize)
+    {
+        BufferType bufferType = buf != null ? BufferType.typeOf(buf) : BufferType.ON_HEAP;
+        return ensureCapacity(buf, outputLength, allowBufferResize, bufferType);
+    }
+
+    /**
+     * Ensure {@code buf} is large enough for {@code outputLength}. If not, it is cleaned up and a new buffer is allocated;
+     * else; buffer has it's position/limit set appropriately.
+     *
+     * @param buf buffer to test the size of; may be null, in which case, a new buffer is allocated.
+     * @param outputLength the minimum target size of the buffer
+     * @param allowBufferResize true if resizing (reallocating) the buffer is allowed
+     * @param bufferType on- or off- heap byte buffer
+     * @return {@code buf} if it was large enough, else a newly allocated buffer.
+     */
+    public static ByteBuffer ensureCapacity(ByteBuffer buf, int outputLength, boolean allowBufferResize, BufferType bufferType)
+    {
+        if (0 > outputLength)
+            throw new IllegalArgumentException("invalid size for output buffer: " + outputLength);
+        if (buf == null || buf.capacity() < outputLength)
+        {
+            if (!allowBufferResize)
+                throw new IllegalStateException(String.format("output buffer is not large enough for data: current capacity %d, required %d", buf.capacity(), outputLength));
+            FileUtils.clean(buf);
+            buf = bufferType.allocate(outputLength);
+        }
+        else
+        {
+            buf.position(0).limit(outputLength);
+        }
+        return buf;
+    }
+
+    /**
+     * Check is the given buffer contains a given sub-buffer.
+     *
+     * @param buffer The buffer to search for sequence of bytes in.
+     * @param subBuffer The buffer to match.
+     *
+     * @return true if buffer contains sub-buffer, false otherwise.
+     */
+    public static boolean contains(ByteBuffer buffer, ByteBuffer subBuffer)
+    {
+        int len = subBuffer.remaining();
+        if (buffer.remaining() - len < 0)
+            return false;
+
+        // adapted form the JDK's String.indexOf()
+        byte first = subBuffer.get(subBuffer.position());
+        int max = buffer.position() + (buffer.remaining() - len);
+
+        for (int i = buffer.position(); i <= max; i++)
+        {
+            /* Look for first character. */
+            if (buffer.get(i) != first)
+            {
+                while (++i <= max && buffer.get(i) != first)
+                {}
+            }
+
+            /* (maybe) Found first character, now look at the rest of v2 */
+            if (i <= max)
+            {
+                int j = i + 1;
+                int end = j + len - 1;
+                for (int k = 1 + subBuffer.position(); j < end && buffer.get(j) == subBuffer.get(k); j++, k++)
+                {}
+
+                if (j == end)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean startsWith(ByteBuffer src, ByteBuffer prefix)
+    {
+        return startsWith(src, prefix, 0);
+    }
+
+    public static boolean endsWith(ByteBuffer src, ByteBuffer suffix)
+    {
+        return startsWith(src, suffix, src.remaining() - suffix.remaining());
+    }
+
+    private static boolean startsWith(ByteBuffer src, ByteBuffer prefix, int offset)
+    {
+        if (offset < 0)
+            return false;
+
+        int sPos = src.position() + offset;
+        int pPos = prefix.position();
+
+        if (src.remaining() - offset < prefix.remaining())
+            return false;
+
+        int len = Math.min(src.remaining() - offset, prefix.remaining());
+
+        while (len-- > 0)
+        {
+            if (src.get(sPos++) != prefix.get(pPos++))
+                return false;
+        }
+
+        return true;
+    }
 }

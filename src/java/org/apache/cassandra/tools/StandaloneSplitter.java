@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -22,8 +22,7 @@ import java.io.File;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.lifecycle.TransactionLog;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.commons.cli.*;
 
@@ -36,7 +35,6 @@ import org.apache.cassandra.db.compaction.SSTableSplitter;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.*;
 import org.apache.cassandra.utils.JVMStabilityInspector;
-import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.tools.BulkLoader.CmdLineOptions;
 
@@ -53,6 +51,8 @@ public class StandaloneSplitter
     public static void main(String args[])
     {
         Options options = Options.parseArgs(args);
+        Util.initDatabaseDescriptor();
+
         try
         {
             // load keyspace descriptions.
@@ -69,12 +69,11 @@ public class StandaloneSplitter
                     continue;
                 }
 
-                Pair<Descriptor, Component> pair = SSTable.tryComponentFromFilename(file.getParentFile(), file.getName());
-                if (pair == null) {
+                Descriptor desc = SSTable.tryDescriptorFromFilename(file);
+                if (desc == null) {
                     System.out.println("Skipping non sstable file " + file);
                     continue;
                 }
-                Descriptor desc = pair.left;
 
                 if (ksName == null)
                     ksName = desc.ksname;
@@ -164,7 +163,7 @@ public class StandaloneSplitter
                 }
             }
             CompactionManager.instance.finishCompactionsAndShutdown(5, TimeUnit.MINUTES);
-            TransactionLog.waitForDeletions();
+            LifecycleTransaction.waitForDeletions();
             System.exit(0); // We need that to stop non daemonized threads
         }
         catch (Exception e)

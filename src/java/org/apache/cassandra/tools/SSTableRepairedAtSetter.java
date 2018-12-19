@@ -27,7 +27,6 @@ import java.util.List;
 
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.service.ActiveRepairService;
 
 /**
  * Set repairedAt status on a given set of sstables.
@@ -63,6 +62,8 @@ public class SSTableRepairedAtSetter
             System.exit(1);
         }
 
+        Util.initDatabaseDescriptor();
+
         boolean setIsRepaired = args[1].equals("--is-repaired");
 
         List<String> fileNames;
@@ -78,21 +79,20 @@ public class SSTableRepairedAtSetter
         for (String fname: fileNames)
         {
             Descriptor descriptor = Descriptor.fromFilename(fname);
-            if (descriptor.version.hasRepairedAt())
+            if (!descriptor.version.isCompatible())
             {
-                if (setIsRepaired)
-                {
-                    FileTime f = Files.getLastModifiedTime(new File(descriptor.filenameFor(Component.DATA)).toPath());
-                    descriptor.getMetadataSerializer().mutateRepairedAt(descriptor, f.toMillis());
-                }
-                else
-                {
-                    descriptor.getMetadataSerializer().mutateRepairedAt(descriptor, ActiveRepairService.UNREPAIRED_SSTABLE);
-                }
+                System.err.println("SSTable " + fname + " is in a old and unsupported format");
+                continue;
+            }
+
+            if (setIsRepaired)
+            {
+                FileTime f = Files.getLastModifiedTime(new File(descriptor.filenameFor(Component.DATA)).toPath());
+                descriptor.getMetadataSerializer().mutateRepairMetadata(descriptor, f.toMillis(), null, false);
             }
             else
             {
-                System.err.println("SSTable " + fname + " does not have repaired property, run upgradesstables");
+                descriptor.getMetadataSerializer().mutateRepairMetadata(descriptor, 0, null, false);
             }
         }
     }

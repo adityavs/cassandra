@@ -17,7 +17,9 @@
  */
 package org.apache.cassandra.security;
 
-import java.io.FileInputStream;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.io.InputStream;
 import java.io.IOException;
 import java.security.Key;
 import java.security.KeyStore;
@@ -26,14 +28,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.TransparentDataEncryptionOptions;
-import org.apache.cassandra.io.util.FileUtils;
 
 /**
  * A {@code KeyProvider} that retrieves keys from a java keystore.
  */
 public class JKSKeyProvider implements KeyProvider
 {
-    private final Logger logger = LoggerFactory.getLogger(JKSKeyProvider.class);
+    private static final Logger logger = LoggerFactory.getLogger(JKSKeyProvider.class);
     static final String PROP_KEYSTORE = "keystore";
     static final String PROP_KEYSTORE_PW = "keystore_password";
     static final String PROP_KEYSTORE_TYPE = "store_type";
@@ -47,10 +48,8 @@ public class JKSKeyProvider implements KeyProvider
     {
         this.options = options;
         logger.info("initializing keystore from file {}", options.get(PROP_KEYSTORE));
-        FileInputStream inputStream = null;
-        try
+        try (InputStream inputStream = Files.newInputStream(Paths.get(options.get(PROP_KEYSTORE))))
         {
-            inputStream = new FileInputStream(options.get(PROP_KEYSTORE));
             store = KeyStore.getInstance(options.get(PROP_KEYSTORE_TYPE));
             store.load(inputStream, options.get(PROP_KEYSTORE_PW).toCharArray());
             isJceks = store.getType().equalsIgnoreCase("jceks");
@@ -58,10 +57,6 @@ public class JKSKeyProvider implements KeyProvider
         catch (Exception e)
         {
             throw new RuntimeException("couldn't load keystore", e);
-        }
-        finally
-        {
-            FileUtils.closeQuietly(inputStream);
         }
     }
 

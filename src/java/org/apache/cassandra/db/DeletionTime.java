@@ -18,17 +18,16 @@
 package org.apache.cassandra.db;
 
 import java.io.IOException;
-import java.security.MessageDigest;
 
 import com.google.common.base.Objects;
+import com.google.common.hash.Hasher;
 
 import org.apache.cassandra.cache.IMeasurableMemory;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.io.ISerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 import org.apache.cassandra.utils.ObjectSizes;
 
 /**
@@ -81,10 +80,21 @@ public class DeletionTime implements Comparable<DeletionTime>, IMeasurableMemory
         return markedForDeleteAt() == Long.MIN_VALUE && localDeletionTime() == Integer.MAX_VALUE;
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Hasher hasher)
     {
-        FBUtilities.updateWithLong(digest, markedForDeleteAt());
-        FBUtilities.updateWithInt(digest, localDeletionTime());
+        // localDeletionTime is basically a metadata of the deletion time that tells us when it's ok to purge it.
+        // It's thus intrinsically a local information and shouldn't be part of the digest (which exists for
+        // cross-nodes comparisons).
+        HashingUtils.updateWithLong(hasher, markedForDeleteAt());
+    }
+
+    /**
+     * check if this deletion time is valid - localDeletionTime can never be negative
+     * @return true if it is valid
+     */
+    public boolean validate()
+    {
+        return localDeletionTime >= 0;
     }
 
     @Override
@@ -117,7 +127,7 @@ public class DeletionTime implements Comparable<DeletionTime>, IMeasurableMemory
         else if (localDeletionTime() < dt.localDeletionTime())
             return -1;
         else if (localDeletionTime() > dt.localDeletionTime())
-            return -1;
+            return 1;
         else
             return 0;
     }
@@ -171,7 +181,7 @@ public class DeletionTime implements Comparable<DeletionTime>, IMeasurableMemory
 
         public void skip(DataInputPlus in) throws IOException
         {
-            FileUtils.skipBytesFully(in, 4 + 8);
+            in.skipBytesFully(4 + 8);
         }
 
         public long serializedSize(DeletionTime delTime)

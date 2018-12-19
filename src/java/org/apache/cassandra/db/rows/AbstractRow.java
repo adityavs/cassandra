@@ -17,16 +17,21 @@
 package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
+import java.util.AbstractCollection;
 import java.util.Objects;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import com.google.common.collect.Iterables;
+import com.google.common.hash.Hasher;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 
 /**
  * Base abstract class for {@code Row} implementations.
@@ -41,11 +46,13 @@ public abstract class AbstractRow implements Row
         return Unfiltered.Kind.ROW;
     }
 
-    public boolean hasLiveData(int nowInSec)
+    @Override
+    public boolean hasLiveData(int nowInSec, boolean enforceStrictLiveness)
     {
         if (primaryKeyLivenessInfo().isLive(nowInSec))
             return true;
-
+        else if (enforceStrictLiveness)
+            return false;
         return Iterables.any(cells(), cell -> cell.isLive(nowInSec));
     }
 
@@ -54,19 +61,19 @@ public abstract class AbstractRow implements Row
         return clustering() == Clustering.STATIC_CLUSTERING;
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Hasher hasher)
     {
-        FBUtilities.updateWithByte(digest, kind().ordinal());
-        clustering().digest(digest);
+        HashingUtils.updateWithByte(hasher, kind().ordinal());
+        clustering().digest(hasher);
 
-        deletion().digest(digest);
-        primaryKeyLivenessInfo().digest(digest);
+        deletion().digest(hasher);
+        primaryKeyLivenessInfo().digest(hasher);
 
         for (ColumnData cd : this)
-            cd.digest(digest);
+            cd.digest(hasher);
     }
 
-    public void validateData(CFMetaData metadata)
+    public void validateData(TableMetadata metadata)
     {
         Clustering clustering = clustering();
         for (int i = 0; i < clustering.size(); i++)
@@ -77,19 +84,41 @@ public abstract class AbstractRow implements Row
         }
 
         primaryKeyLivenessInfo().validate();
-        if (deletion().localDeletionTime() < 0)
+        if (deletion().time().localDeletionTime() < 0)
             throw new MarshalException("A local deletion time should not be negative");
 
         for (ColumnData cd : this)
             cd.validate();
     }
 
-    public String toString(CFMetaData metadata)
+    public boolean hasInvalidDeletions()
+    {
+        if (primaryKeyLivenessInfo().isExpiring() && (primaryKeyLivenessInfo().ttl() < 0 || primaryKeyLivenessInfo().localExpirationTime() < 0))
+            return true;
+        if (!deletion().time().validate())
+            return true;
+        for (ColumnData cd : this)
+            if (cd.hasInvalidDeletions())
+                return true;
+        return false;
+    }
+
+    public String toString()
+    {
+        return columnData().toString();
+    }
+
+    public String toString(TableMetadata metadata)
     {
         return toString(metadata, false);
     }
 
-    public String toString(CFMetaData metadata, boolean fullDetails)
+    public String toString(TableMetadata metadata, boolean fullDetails)
+    {
+        return toString(metadata, true, fullDetails);
+    }
+
+    public String toString(TableMetadata metadata, boolean includeClusterKeys, boolean fullDetails)
     {
         StringBuilder sb = new StringBuilder();
         sb.append("Row");
@@ -100,7 +129,12 @@ public abstract class AbstractRow implements Row
                 sb.append(" del=").append(deletion());
             sb.append(" ]");
         }
-        sb.append(": ").append(clustering().toString(metadata)).append(" | ");
+        sb.append(": ");
+        if(includeClusterKeys)
+            sb.append(clustering().toString(metadata));
+        else
+            sb.append(clustering().toCQLString(metadata));
+        sb.append(" | ");
         boolean isFirst = true;
         for (ColumnData cd : this)
         {
@@ -125,20 +159,42 @@ public abstract class AbstractRow implements Row
                 if (cd.column().isSimple())
                 {
                     Cell cell = (Cell)cd;
-                    sb.append(cell.column().name).append('=').append(cell.column().type.getString(cell.value()));
+                    sb.append(cell.column().name).append('=');
+                    if (cell.isTombstone())
+                        sb.append("<tombstone>");
+                    else
+                        sb.append(cell.column().type.getString(cell.value()));
                 }
                 else
                 {
-                    ComplexColumnData complexData = (ComplexColumnData)cd;
-                    CollectionType ct = (CollectionType)cd.column().type;
-                    sb.append(cd.column().name).append("={");
-                    int i = 0;
-                    for (Cell cell : complexData)
+                    sb.append(cd.column().name).append('=');
+                    ComplexColumnData complexData = (ComplexColumnData) cd;
+                    Function<Cell, String> transform = null;
+                    if (cd.column().type.isCollection())
                     {
-                        sb.append(i++ == 0 ? "" : ", ");
-                        sb.append(ct.nameComparator().getString(cell.path().get(0))).append("->").append(ct.valueComparator().getString(cell.value()));
+                        CollectionType ct = (CollectionType) cd.column().type;
+                        transform = cell -> String.format("%s -> %s",
+                                                  ct.nameComparator().getString(cell.path().get(0)),
+                                                  ct.valueComparator().getString(cell.value()));
+
                     }
-                    sb.append('}');
+                    else if (cd.column().type.isUDT())
+                    {
+                        UserType ut = (UserType)cd.column().type;
+                        transform = cell -> {
+                            Short fId = ut.nameComparator().getSerializer().deserialize(cell.path().get(0));
+                            return String.format("%s -> %s",
+                                                 ut.fieldNameAsString(fId),
+                                                 ut.fieldType(fId).getString(cell.value()));
+                        };
+                    }
+                    else
+                    {
+                        transform = cell -> "";
+                    }
+                    sb.append(StreamSupport.stream(complexData.spliterator(), false)
+                                           .map(transform)
+                                           .collect(Collectors.joining(", ", "{", "}")));
                 }
             }
         }
@@ -153,7 +209,6 @@ public abstract class AbstractRow implements Row
 
         Row that = (Row)other;
         if (!this.clustering().equals(that.clustering())
-             || !this.columns().equals(that.columns())
              || !this.primaryKeyLivenessInfo().equals(that.primaryKeyLivenessInfo())
              || !this.deletion().equals(that.deletion()))
             return false;
@@ -164,7 +219,7 @@ public abstract class AbstractRow implements Row
     @Override
     public int hashCode()
     {
-        int hash = Objects.hash(clustering(), columns(), primaryKeyLivenessInfo(), deletion());
+        int hash = Objects.hash(clustering(), primaryKeyLivenessInfo(), deletion());
         for (ColumnData cd : this)
             hash += 31 * cd.hashCode();
         return hash;

@@ -58,6 +58,11 @@ final class EncodedHintMessage
         return new MessageOut<>(MessagingService.Verb.HINT, this, serializer);
     }
 
+    public long getHintCreationTime()
+    {
+        return Hint.serializer.getHintCreationTime(hint, version);
+    }
+
     private static class Serializer implements IVersionedSerializer<EncodedHintMessage>
     {
         public long serializedSize(EncodedHintMessage message, int version)
@@ -65,8 +70,8 @@ final class EncodedHintMessage
             if (version != message.version)
                 throw new IllegalArgumentException("serializedSize() called with non-matching version " + version);
 
-            int size = (int) UUIDSerializer.serializer.serializedSize(message.hostId, version);
-            size += TypeSizes.sizeof(message.hint.remaining());
+            long size = UUIDSerializer.serializer.serializedSize(message.hostId, version);
+            size += TypeSizes.sizeofUnsignedVInt(message.hint.remaining());
             size += message.hint.remaining();
             return size;
         }
@@ -77,7 +82,7 @@ final class EncodedHintMessage
                 throw new IllegalArgumentException("serialize() called with non-matching version " + version);
 
             UUIDSerializer.serializer.serialize(message.hostId, out, version);
-            out.writeInt(message.hint.remaining());
+            out.writeUnsignedVInt(message.hint.remaining());
             out.write(message.hint);
         }
 

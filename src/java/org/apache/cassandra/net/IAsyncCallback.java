@@ -17,12 +17,6 @@
  */
 package org.apache.cassandra.net;
 
-import java.net.InetAddress;
-
-import com.google.common.base.Predicate;
-
-import org.apache.cassandra.gms.FailureDetector;
-
 /**
  * implementors of IAsyncCallback need to make sure that any public methods
  * are threadsafe with respect to response() being called from the message
@@ -31,22 +25,19 @@ import org.apache.cassandra.gms.FailureDetector;
  */
 public interface IAsyncCallback<T>
 {
-    public static Predicate<InetAddress> isAlive = new Predicate<InetAddress>()
-    {
-        public boolean apply(InetAddress endpoint)
-        {
-            return FailureDetector.instance.isAlive(endpoint);
-        }
-    };
-
     /**
      * @param msg response received.
      */
-    public void response(MessageIn<T> msg);
+    void response(MessageIn<T> msg);
 
     /**
      * @return true if this callback is on the read path and its latency should be
      * given as input to the dynamic snitch.
      */
     boolean isLatencyForSnitch();
+
+    default boolean supportsBackPressure()
+    {
+        return false;
+    }
 }

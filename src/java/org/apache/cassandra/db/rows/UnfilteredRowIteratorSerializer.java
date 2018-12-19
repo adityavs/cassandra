@@ -23,11 +23,11 @@ import java.io.IOError;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -36,6 +36,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * The serialization is composed of a header, follows by the rows and range tombstones of the iterator serialized
  * until we read the end of the partition (see UnfilteredSerializer for details). The header itself
  * is:
+ * {@code
  *     <cfid><key><flags><s_header>[<partition_deletion>][<static_row>][<row_estimate>]
  * where:
  *     <cfid> is the table cfid.
@@ -54,6 +55,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  *     <static_row> is the static row for this partition as serialized by UnfilteredSerializer.
  *     <row_estimate> is the (potentially estimated) number of rows serialized. This is only used for
  *         the purpose of sizing on the receiving end and should not be relied upon too strongly.
+ * }
  *
  * Please note that the format described above is the on-wire format. On-disk, the format is basically the
  * same, but the header is written once per sstable, not once per-partition. Further, the actual row and
@@ -78,17 +80,23 @@ public class UnfilteredRowIteratorSerializer
     }
 
     // Should only be used for the on-wire format.
+
     public void serialize(UnfilteredRowIterator iterator, ColumnFilter selection, DataOutputPlus out, int version, int rowEstimate) throws IOException
     {
-        SerializationHeader header = new SerializationHeader(iterator.metadata(),
+
+        SerializationHeader header = new SerializationHeader(false,
+                                                             iterator.metadata(),
                                                              iterator.columns(),
                                                              iterator.stats());
+
         serialize(iterator, header, selection, out, version, rowEstimate);
     }
 
     // Should only be used for the on-wire format.
     public void serialize(UnfilteredRowIterator iterator, SerializationHeader header, ColumnFilter selection, DataOutputPlus out, int version, int rowEstimate) throws IOException
     {
+        assert !header.isForSSTable();
+
         ByteBufferUtil.writeWithVIntLength(iterator.partitionKey().getKey(), out);
 
         int flags = 0;
@@ -123,7 +131,7 @@ public class UnfilteredRowIteratorSerializer
             UnfilteredSerializer.serializer.serialize(staticRow, header, out, version);
 
         if (rowEstimate >= 0)
-            out.writeVInt(rowEstimate);
+            out.writeUnsignedVInt(rowEstimate);
 
         while (iterator.hasNext())
             UnfilteredSerializer.serializer.serialize(iterator.next(), header, out, version);
@@ -134,7 +142,8 @@ public class UnfilteredRowIteratorSerializer
     // recreate an iterator for both serialize and serializedSize, which is mostly only PartitionUpdate/ArrayBackedCachedPartition.
     public long serializedSize(UnfilteredRowIterator iterator, ColumnFilter selection, int version, int rowEstimate)
     {
-        SerializationHeader header = new SerializationHeader(iterator.metadata(),
+        SerializationHeader header = new SerializationHeader(false,
+                                                             iterator.metadata(),
                                                              iterator.columns(),
                                                              iterator.stats());
 
@@ -159,7 +168,7 @@ public class UnfilteredRowIteratorSerializer
             size += UnfilteredSerializer.serializer.serializedSize(staticRow, header, version);
 
         if (rowEstimate >= 0)
-            size += TypeSizes.sizeofVInt(rowEstimate);
+            size += TypeSizes.sizeofUnsignedVInt(rowEstimate);
 
         while (iterator.hasNext())
             size += UnfilteredSerializer.serializer.serializedSize(iterator.next(), header, version);
@@ -168,14 +177,14 @@ public class UnfilteredRowIteratorSerializer
         return size;
     }
 
-    public Header deserializeHeader(CFMetaData metadata, ColumnFilter selection, DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+    public Header deserializeHeader(TableMetadata metadata, ColumnFilter selection, DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
     {
-        DecoratedKey key = metadata.decorateKey(ByteBufferUtil.readWithVIntLength(in));
+        DecoratedKey key = metadata.partitioner.decorateKey(ByteBufferUtil.readWithVIntLength(in));
         int flags = in.readUnsignedByte();
         boolean isReversed = (flags & IS_REVERSED) != 0;
         if ((flags & IS_EMPTY) != 0)
         {
-            SerializationHeader sh = new SerializationHeader(metadata, PartitionColumns.NONE, EncodingStats.NO_STATS);
+            SerializationHeader sh = new SerializationHeader(false, metadata, RegularAndStaticColumns.NONE, EncodingStats.NO_STATS);
             return new Header(sh, key, isReversed, true, null, null, 0);
         }
 
@@ -191,20 +200,20 @@ public class UnfilteredRowIteratorSerializer
         if (hasStatic)
             staticRow = UnfilteredSerializer.serializer.deserializeStaticRow(in, header, new SerializationHelper(metadata, version, flag));
 
-        int rowEstimate = hasRowEstimate ? (int)in.readVInt() : -1;
+        int rowEstimate = hasRowEstimate ? (int)in.readUnsignedVInt() : -1;
         return new Header(header, key, isReversed, false, partitionDeletion, staticRow, rowEstimate);
     }
 
-    public UnfilteredRowIterator deserialize(DataInputPlus in, int version, CFMetaData metadata, SerializationHelper.Flag flag, Header header) throws IOException
+    public UnfilteredRowIterator deserialize(DataInputPlus in, int version, TableMetadata metadata, SerializationHelper.Flag flag, Header header) throws IOException
     {
         if (header.isEmpty)
-            return UnfilteredRowIterators.emptyIterator(metadata, header.key, header.isReversed);
+            return EmptyIterators.unfilteredRow(metadata, header.key, header.isReversed);
 
         final SerializationHelper helper = new SerializationHelper(metadata, version, flag);
         final SerializationHeader sHeader = header.sHeader;
         return new AbstractUnfilteredRowIterator(metadata, header.key, header.partitionDeletion, sHeader.columns(), header.staticRow, header.isReversed, sHeader.stats())
         {
-            private final Row.Builder builder = BTreeRow.sortedBuilder(sHeader.columns().regulars);
+            private final Row.Builder builder = BTreeRow.sortedBuilder();
 
             protected Unfiltered computeNext()
             {
@@ -221,7 +230,7 @@ public class UnfilteredRowIteratorSerializer
         };
     }
 
-    public UnfilteredRowIterator deserialize(DataInputPlus in, int version, CFMetaData metadata, ColumnFilter selection, SerializationHelper.Flag flag) throws IOException
+    public UnfilteredRowIterator deserialize(DataInputPlus in, int version, TableMetadata metadata, ColumnFilter selection, SerializationHelper.Flag flag) throws IOException
     {
         return deserialize(in, version, metadata, flag, deserializeHeader(metadata, selection, in, version, flag));
     }

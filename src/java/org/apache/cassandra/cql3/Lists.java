@@ -22,20 +22,25 @@ import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
 
 /**
@@ -52,10 +57,70 @@ public abstract class Lists
 
     public static ColumnSpecification valueSpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((ListType)column.type).getElementsType());
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((ListType<?>)column.type).getElementsType());
     }
 
-    public static class Literal implements Term.Raw
+    /**
+     * Tests that the list with the specified elements can be assigned to the specified column.
+     *
+     * @param receiver the receiving column
+     * @param elements the list elements
+     */
+    public static AssignmentTestable.TestResult testListAssignment(ColumnSpecification receiver,
+                                                                   List<? extends AssignmentTestable> elements)
+    {
+        if (!(receiver.type instanceof ListType))
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
+        // If there is no elements, we can't say it's an exact match (an empty list if fundamentally polymorphic).
+        if (elements.isEmpty())
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+        ColumnSpecification valueSpec = valueSpecOf(receiver);
+        return AssignmentTestable.TestResult.testAll(receiver.ksName, valueSpec, elements);
+    }
+
+    /**
+     * Create a <code>String</code> representation of the list containing the specified elements.
+     *
+     * @param elements the list elements
+     * @return a <code>String</code> representation of the list
+     */
+    public static String listToString(List<?> elements)
+    {
+        return listToString(elements, Object::toString);
+    }
+
+    /**
+     * Create a <code>String</code> representation of the list from the specified items associated to
+     * the list elements.
+     *
+     * @param items items associated to the list elements
+     * @param mapper the mapper used to map the items to the <code>String</code> representation of the list elements
+     * @return a <code>String</code> representation of the list
+     */
+    public static <T> String listToString(Iterable<T> items, java.util.function.Function<T, String> mapper)
+    {
+        return StreamSupport.stream(items.spliterator(), false)
+                            .map(e -> mapper.apply(e))
+                            .collect(Collectors.joining(", ", "[", "]"));
+    }
+
+    /**
+     * Returns the exact ListType from the items if it can be known.
+     *
+     * @param items the items mapped to the list elements
+     * @param mapper the mapper used to retrieve the element types from the items
+     * @return the exact ListType from the items if it can be known or <code>null</code>
+     */
+    public static <T> AbstractType<?> getExactListTypeIfKnown(List<T> items,
+                                                              java.util.function.Function<T, AbstractType<?>> mapper)
+    {
+        Optional<AbstractType<?>> type = items.stream().map(mapper).filter(Objects::nonNull).findFirst();
+        return type.isPresent() ? ListType.getInstance(type.get(), false) : null;
+    }
+
+    public static class Literal extends Term.Raw
     {
         private final List<Term.Raw> elements;
 
@@ -102,21 +167,18 @@ public abstract class Lists
 
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            if (!(receiver.type instanceof ListType))
-                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
-
-            // If there is no elements, we can't say it's an exact match (an empty list if fundamentally polymorphic).
-            if (elements.isEmpty())
-                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
-
-            ColumnSpecification valueSpec = Lists.valueSpecOf(receiver);
-            return AssignmentTestable.TestResult.testAll(keyspace, valueSpec, elements);
+            return testListAssignment(receiver, elements);
         }
 
         @Override
-        public String toString()
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            return elements.toString();
+            return getExactListTypeIfKnown(elements, p -> p.getExactTypeIfKnown(keyspace));
+        }
+
+        public String getText()
+        {
+            return listToString(elements, Term.Raw::getText);
         }
     }
 
@@ -129,7 +191,7 @@ public abstract class Lists
             this.elements = elements;
         }
 
-        public static Value fromSerialized(ByteBuffer value, ListType type, int version) throws InvalidRequestException
+        public static Value fromSerialized(ByteBuffer value, ListType type, ProtocolVersion version) throws InvalidRequestException
         {
             try
             {
@@ -148,7 +210,7 @@ public abstract class Lists
             }
         }
 
-        public ByteBuffer get(int protocolVersion)
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             return CollectionSerializer.pack(elements, elements.size(), protocolVersion);
         }
@@ -211,20 +273,14 @@ public abstract class Lists
                 if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                     return UNSET_VALUE;
 
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (bytes.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("List value is too long. List values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    bytes.remaining()));
-
                 buffers.add(bytes);
             }
             return new Value(buffers);
         }
 
-        public Iterable<Function> getFunctions()
+        public void addFunctionsTo(List<Function> functions)
         {
-            return Terms.getFunctions(elements);
+            Terms.addFunctions(elements, functions);
         }
     }
 
@@ -250,18 +306,17 @@ public abstract class Lists
         }
     }
 
-    /*
+    /**
      * For prepend, we need to be able to generate unique but decreasing time
-     * UUID, which is a bit challenging. To do that, given a time in milliseconds,
-     * we adds a number representing the 100-nanoseconds precision and make sure
-     * that within the same millisecond, that number is always decreasing. We
-     * do rely on the fact that the user will only provide decreasing
-     * milliseconds timestamp for that purpose.
+     * UUIDs, which is a bit challenging. To do that, given a time in milliseconds,
+     * we add a number representing the 100-nanoseconds precision and make sure
+     * that within the same millisecond, that number is always decreasing.
      */
-    private static class PrecisionTime
+    static class PrecisionTime
     {
         // Our reference time (1 jan 2010, 00:00:00) in milliseconds.
         private static final long REFERENCE_TIME = 1262304000000L;
+        static final int MAX_NANOS = 9999;
         private static final AtomicReference<PrecisionTime> last = new AtomicReference<>(new PrecisionTime(Long.MAX_VALUE, 0));
 
         public final long millis;
@@ -273,26 +328,57 @@ public abstract class Lists
             this.nanos = nanos;
         }
 
-        static PrecisionTime getNext(long millis)
+        static PrecisionTime getNext(long millis, int count)
         {
+            if (count == 0)
+                return last.get();
+
             while (true)
             {
                 PrecisionTime current = last.get();
 
-                assert millis <= current.millis;
-                PrecisionTime next = millis < current.millis
-                    ? new PrecisionTime(millis, 9999)
-                    : new PrecisionTime(millis, Math.max(0, current.nanos - 1));
+                final PrecisionTime next;
+                if (millis < current.millis)
+                {
+                    next = new PrecisionTime(millis, MAX_NANOS - count);
+                }
+                else
+                {
+                    // in addition to being at the same millisecond, we handle the unexpected case of the millis parameter
+                    // being in the past. That could happen if the System.currentTimeMillis() not operating montonically
+                    // or if one thread is just a really big loser in the compareAndSet game of life.
+                    long millisToUse = millis <= current.millis ? millis : current.millis;
+
+                    // if we will go below zero on the nanos, decrement the millis by one
+                    final int nanosToUse;
+                    if (current.nanos - count >= 0)
+                    {
+                        nanosToUse = current.nanos - count;
+                    }
+                    else
+                    {
+                        nanosToUse = MAX_NANOS - count;
+                        millisToUse -= 1;
+                    }
+
+                    next = new PrecisionTime(millisToUse, nanosToUse);
+                }
 
                 if (last.compareAndSet(current, next))
                     return next;
             }
         }
+
+        @VisibleForTesting
+        static void set(long millis, int nanos)
+        {
+            last.set(new PrecisionTime(millis, nanos));
+        }
     }
 
     public static class Setter extends Operation
     {
-        public Setter(ColumnDefinition column, Term t)
+        public Setter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -310,7 +396,7 @@ public abstract class Lists
         }
     }
 
-    private static int existingSize(Row row, ColumnDefinition column)
+    private static int existingSize(Row row, ColumnMetadata column)
     {
         if (row == null)
             return 0;
@@ -323,7 +409,7 @@ public abstract class Lists
     {
         private final Term idx;
 
-        public SetterByIndex(ColumnDefinition column, Term idx, Term t)
+        public SetterByIndex(ColumnMetadata column, Term idx, Term t)
         {
             super(column, t);
             this.idx = idx;
@@ -365,25 +451,15 @@ public abstract class Lists
 
             CellPath elementPath = existingRow.getComplexColumnData(column).getCellByIndex(idx).path();
             if (value == null)
-            {
-                params.addTombstone(column);
-            }
+                params.addTombstone(column, elementPath);
             else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER)
-            {
-                // We don't support value > 64K because the serialization format encode the length as an unsigned short.
-                if (value.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                    throw new InvalidRequestException(String.format("List value is too long. List values are limited to %d bytes but %d bytes value provided",
-                                                                    FBUtilities.MAX_UNSIGNED_SHORT,
-                                                                    value.remaining()));
-
                 params.addCell(column, elementPath, value);
-            }
         }
     }
 
     public static class Appender extends Operation
     {
-        public Appender(ColumnDefinition column, Term t)
+        public Appender(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -395,7 +471,7 @@ public abstract class Lists
             doAppend(value, column, params);
         }
 
-        static void doAppend(Term.Terminal value, ColumnDefinition column, UpdateParameters params) throws InvalidRequestException
+        static void doAppend(Term.Terminal value, ColumnMetadata column, UpdateParameters params) throws InvalidRequestException
         {
             if (column.type.isMultiCell())
             {
@@ -416,14 +492,14 @@ public abstract class Lists
                 if (value == null)
                     params.addTombstone(column);
                 else
-                    params.addCell(column, value.get(Server.CURRENT_VERSION));
+                    params.addCell(column, value.get(ProtocolVersion.CURRENT));
             }
         }
     }
 
     public static class Prepender extends Operation
     {
-        public Prepender(ColumnDefinition column, Term t)
+        public Prepender(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -435,13 +511,23 @@ public abstract class Lists
             if (value == null || value == UNSET_VALUE)
                 return;
 
-            long time = PrecisionTime.REFERENCE_TIME - (System.currentTimeMillis() - PrecisionTime.REFERENCE_TIME);
-
             List<ByteBuffer> toAdd = ((Value) value).elements;
-            for (int i = toAdd.size() - 1; i >= 0; i--)
+            final int totalCount = toAdd.size();
+
+            // we have to obey MAX_NANOS per batch - in the unlikely event a client has decided to prepend a list with
+            // an insane number of entries.
+            PrecisionTime pt = null;
+            int remainingInBatch = 0;
+            for (int i = totalCount - 1; i >= 0; i--)
             {
-                PrecisionTime pt = PrecisionTime.getNext(time);
-                ByteBuffer uuid = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(pt.millis, pt.nanos));
+                if (remainingInBatch == 0)
+                {
+                    long time = PrecisionTime.REFERENCE_TIME - (System.currentTimeMillis() - PrecisionTime.REFERENCE_TIME);
+                    remainingInBatch = Math.min(PrecisionTime.MAX_NANOS, i) + 1;
+                    pt = PrecisionTime.getNext(time, remainingInBatch);
+                }
+
+                ByteBuffer uuid = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(pt.millis, (pt.nanos + remainingInBatch--)));
                 params.addCell(column, CellPath.create(uuid), toAdd.get(i));
             }
         }
@@ -449,7 +535,7 @@ public abstract class Lists
 
     public static class Discarder extends Operation
     {
-        public Discarder(ColumnDefinition column, Term t)
+        public Discarder(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -487,7 +573,7 @@ public abstract class Lists
 
     public static class DiscarderByIndex extends Operation
     {
-        public DiscarderByIndex(ColumnDefinition column, Term idx)
+        public DiscarderByIndex(ColumnMetadata column, Term idx)
         {
             super(column, idx);
         }

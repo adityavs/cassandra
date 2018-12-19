@@ -19,6 +19,7 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.cassandra.cql3.Json;
 import org.apache.cassandra.cql3.Sets;
@@ -28,12 +29,13 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.SetSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 public class SetType<T> extends CollectionType<Set<T>>
 {
     // interning instances
-    private static final Map<AbstractType<?>, SetType> instances = new HashMap<>();
-    private static final Map<AbstractType<?>, SetType> frozenInstances = new HashMap<>();
+    private static final ConcurrentHashMap<AbstractType<?>, SetType> instances = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<AbstractType<?>, SetType> frozenInstances = new ConcurrentHashMap<>();
 
     private final AbstractType<T> elements;
     private final SetSerializer<T> serializer;
@@ -48,24 +50,44 @@ public class SetType<T> extends CollectionType<Set<T>>
         return getInstance(l.get(0), true);
     }
 
-    public static synchronized <T> SetType<T> getInstance(AbstractType<T> elements, boolean isMultiCell)
+    public static <T> SetType<T> getInstance(AbstractType<T> elements, boolean isMultiCell)
     {
-        Map<AbstractType<?>, SetType> internMap = isMultiCell ? instances : frozenInstances;
+        ConcurrentHashMap<AbstractType<?>, SetType> internMap = isMultiCell ? instances : frozenInstances;
         SetType<T> t = internMap.get(elements);
-        if (t == null)
-        {
-            t = new SetType<T>(elements, isMultiCell);
-            internMap.put(elements, t);
-        }
-        return t;
+        return null == t
+             ? internMap.computeIfAbsent(elements, k -> new SetType<>(k, isMultiCell))
+             : t;
     }
 
     public SetType(AbstractType<T> elements, boolean isMultiCell)
     {
-        super(Kind.SET);
+        super(ComparisonType.CUSTOM, Kind.SET);
         this.elements = elements;
-        this.serializer = SetSerializer.getInstance(elements.getSerializer());
+        this.serializer = SetSerializer.getInstance(elements.getSerializer(), elements);
         this.isMultiCell = isMultiCell;
+    }
+
+    @Override
+    public boolean referencesUserType(ByteBuffer name)
+    {
+        return elements.referencesUserType(name);
+    }
+
+    @Override
+    public SetType<?> withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        (isMultiCell ? instances : frozenInstances).remove(elements);
+
+        return getInstance(elements.withUpdatedUserType(udt), isMultiCell);
+    }
+
+    @Override
+    public AbstractType<?> expandUserTypes()
+    {
+        return getInstance(elements.expandUserTypes(), isMultiCell);
     }
 
     public AbstractType<T> getElementsType()
@@ -99,6 +121,18 @@ public class SetType<T> extends CollectionType<Set<T>>
     }
 
     @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
+            return this;
+
+        if (elements.isFreezable() && elements.isMultiCell())
+            return getInstance(elements.freeze(), isMultiCell);
+
+        return getInstance(elements.freezeNestedMulticellTypes(), isMultiCell);
+    }
+
+    @Override
     public boolean isCompatibleWithFrozen(CollectionType<?> previous)
     {
         assert !isMultiCell;
@@ -113,7 +147,7 @@ public class SetType<T> extends CollectionType<Set<T>>
     }
 
     @Override
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         return ListType.compareListOrSet(elements, o1, o2);
     }
@@ -121,11 +155,6 @@ public class SetType<T> extends CollectionType<Set<T>>
     public SetSerializer<T> getSerializer()
     {
         return serializer;
-    }
-
-    public boolean isByteOrderComparable()
-    {
-        return elements.isByteOrderComparable();
     }
 
     @Override
@@ -174,7 +203,7 @@ public class SetType<T> extends CollectionType<Set<T>>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return ListType.setOrListToJsonString(buffer, elements, protocolVersion);
     }

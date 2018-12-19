@@ -18,59 +18,59 @@
 package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.Objects;
 
-import org.apache.cassandra.config.CFMetaData;
+import com.google.common.hash.Hasher;
+
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
 
 /**
  * A range tombstone marker that indicates the bound of a range tombstone (start or end).
  */
-public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker
+public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker<ClusteringBound>
 {
     private final DeletionTime deletion;
 
-    public RangeTombstoneBoundMarker(RangeTombstone.Bound bound, DeletionTime deletion)
+    public RangeTombstoneBoundMarker(ClusteringBound bound, DeletionTime deletion)
     {
         super(bound);
-        assert !bound.isBoundary();
         this.deletion = deletion;
-    }
-
-    public RangeTombstoneBoundMarker(Slice.Bound bound, DeletionTime deletion)
-    {
-        this(new RangeTombstone.Bound(bound.kind(), bound.getRawValues()), deletion);
     }
 
     public static RangeTombstoneBoundMarker inclusiveOpen(boolean reversed, ByteBuffer[] boundValues, DeletionTime deletion)
     {
-        RangeTombstone.Bound bound = RangeTombstone.Bound.inclusiveOpen(reversed, boundValues);
+        ClusteringBound bound = ClusteringBound.inclusiveOpen(reversed, boundValues);
         return new RangeTombstoneBoundMarker(bound, deletion);
     }
 
     public static RangeTombstoneBoundMarker exclusiveOpen(boolean reversed, ByteBuffer[] boundValues, DeletionTime deletion)
     {
-        RangeTombstone.Bound bound = RangeTombstone.Bound.exclusiveOpen(reversed, boundValues);
+        ClusteringBound bound = ClusteringBound.exclusiveOpen(reversed, boundValues);
         return new RangeTombstoneBoundMarker(bound, deletion);
     }
 
     public static RangeTombstoneBoundMarker inclusiveClose(boolean reversed, ByteBuffer[] boundValues, DeletionTime deletion)
     {
-        RangeTombstone.Bound bound = RangeTombstone.Bound.inclusiveClose(reversed, boundValues);
+        ClusteringBound bound = ClusteringBound.inclusiveClose(reversed, boundValues);
         return new RangeTombstoneBoundMarker(bound, deletion);
     }
 
     public static RangeTombstoneBoundMarker exclusiveClose(boolean reversed, ByteBuffer[] boundValues, DeletionTime deletion)
     {
-        RangeTombstone.Bound bound = RangeTombstone.Bound.exclusiveClose(reversed, boundValues);
+        ClusteringBound bound = ClusteringBound.exclusiveClose(reversed, boundValues);
         return new RangeTombstoneBoundMarker(bound, deletion);
     }
 
     public boolean isBoundary()
     {
         return false;
+    }
+
+    public boolean hasInvalidDeletions()
+    {
+        return !deletionTime().validate();
     }
 
     /**
@@ -109,12 +109,12 @@ public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker
         return bound.isInclusive();
     }
 
-    public RangeTombstone.Bound openBound(boolean reversed)
+    public ClusteringBound openBound(boolean reversed)
     {
         return isOpen(reversed) ? clustering() : null;
     }
 
-    public RangeTombstone.Bound closeBound(boolean reversed)
+    public ClusteringBound closeBound(boolean reversed)
     {
         return isClose(reversed) ? clustering() : null;
     }
@@ -124,15 +124,23 @@ public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker
         return new RangeTombstoneBoundMarker(clustering().copy(allocator), deletion);
     }
 
-    public void digest(MessageDigest digest)
+    public RangeTombstoneBoundMarker withNewOpeningDeletionTime(boolean reversed, DeletionTime newDeletionTime)
     {
-        bound.digest(digest);
-        deletion.digest(digest);
+        if (!isOpen(reversed))
+            throw new IllegalStateException();
+
+        return new RangeTombstoneBoundMarker(clustering(), newDeletionTime);
     }
 
-    public String toString(CFMetaData metadata)
+    public void digest(Hasher hasher)
     {
-        return "Marker " + bound.toString(metadata) + '@' + deletion.markedForDeleteAt();
+        bound.digest(hasher);
+        deletion.digest(hasher);
+    }
+
+    public String toString(TableMetadata metadata)
+    {
+        return String.format("Marker %s@%d/%d", bound.toString(metadata), deletion.markedForDeleteAt(), deletion.localDeletionTime());
     }
 
     @Override

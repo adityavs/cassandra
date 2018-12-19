@@ -17,36 +17,16 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.db.compaction.OperationType;
-import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.rows.RowIterators;
-import org.apache.cassandra.db.rows.Unfiltered;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.db.rows.UnfilteredRowIterators;
-import org.apache.cassandra.io.sstable.ISSTableScanner;
-import org.apache.cassandra.io.sstable.SSTableMultiWriter;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.utils.JVMStabilityInspector;
-import org.apache.cassandra.utils.Pair;
-
-import org.apache.cassandra.utils.concurrent.Refs;
 
 /**
  * Task that manages receiving files for the session for certain ColumnFamily.
@@ -57,45 +37,54 @@ public class StreamReceiveTask extends StreamTask
 
     private static final ExecutorService executor = Executors.newCachedThreadPool(new NamedThreadFactory("StreamReceiveTask"));
 
-    // number of files to receive
-    private final int totalFiles;
-    // total size of files to receive
+    private final StreamReceiver receiver;
+
+    // number of streams to receive
+    private final int totalStreams;
+
+    // total size of streams to receive
     private final long totalSize;
 
-    // Transaction tracking new files received
-    public final LifecycleTransaction txn;
-
     // true if task is done (either completed or aborted)
-    private boolean done = false;
+    private volatile boolean done = false;
 
-    //  holds references to SSTables received
-    protected Collection<SSTableMultiWriter> sstables;
+    private int remoteStreamsReceived = 0;
+    private long bytesReceived = 0;
 
-    public StreamReceiveTask(StreamSession session, UUID cfId, int totalFiles, long totalSize)
+    public StreamReceiveTask(StreamSession session, TableId tableId, int totalStreams, long totalSize)
     {
-        super(session, cfId);
-        this.totalFiles = totalFiles;
+        super(session, tableId);
+        this.receiver = ColumnFamilyStore.getIfExists(tableId).getStreamManager().createStreamReceiver(session, totalStreams);
+        this.totalStreams = totalStreams;
         this.totalSize = totalSize;
-        // this is an "offline" transaction, as we currently manually expose the sstables once done;
-        // this should be revisited at a later date, so that LifecycleTransaction manages all sstable state changes
-        this.txn = LifecycleTransaction.offline(OperationType.STREAM, Schema.instance.getCFMetaData(cfId));
-        this.sstables = new ArrayList<>(totalFiles);
     }
 
     /**
-     * Process received file.
+     * Process received stream.
      *
-     * @param sstable SSTable file received.
+     * @param stream Stream received.
      */
-    public synchronized void received(SSTableMultiWriter sstable)
+    public synchronized void received(IncomingStream stream)
     {
+        Preconditions.checkState(!session.isPreview(), "we should never receive sstables when previewing");
+
         if (done)
+        {
+            logger.warn("[{}] Received stream {} on already finished stream received task. Aborting stream.", session.planId(),
+                        stream.getName());
+            receiver.discardStream(stream);
             return;
+        }
 
-        assert cfId.equals(sstable.getCfId());
+        remoteStreamsReceived++;
+        bytesReceived += stream.getSize();
+        Preconditions.checkArgument(tableId.equals(stream.getTableId()));
+        logger.debug("received {} of {} total files {} of total bytes {}", remoteStreamsReceived, totalStreams,
+                     bytesReceived, totalSize);
 
-        sstables.add(sstable);
-        if (sstables.size() == totalFiles)
+        receiver.received(stream);
+
+        if (remoteStreamsReceived == totalStreams)
         {
             done = true;
             executor.submit(new OnCompletionRunnable(this));
@@ -104,12 +93,19 @@ public class StreamReceiveTask extends StreamTask
 
     public int getTotalNumberOfFiles()
     {
-        return totalFiles;
+        return totalStreams;
     }
 
     public long getTotalSize()
     {
         return totalSize;
+    }
+
+    public synchronized StreamReceiver getReceiver()
+    {
+        if (done)
+            throw new RuntimeException(String.format("Stream receive task %s of cf %s already finished.", session.planId(), tableId));
+        return receiver;
     }
 
     private static class OnCompletionRunnable implements Runnable
@@ -123,79 +119,27 @@ public class StreamReceiveTask extends StreamTask
 
         public void run()
         {
-            Pair<String, String> kscf = Schema.instance.getCF(task.cfId);
-            if (kscf == null)
-            {
-                // schema was dropped during streaming
-                task.sstables.forEach(SSTableMultiWriter::abortOrDie);
-
-                task.sstables.clear();
-                task.txn.abort();
-                return;
-            }
-            ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
-            boolean hasMaterializedViews = cfs.materializedViewManager.allViews().iterator().hasNext();
-
             try
             {
-                List<SSTableReader> readers = new ArrayList<>();
-                for (SSTableMultiWriter writer : task.sstables)
+                if (ColumnFamilyStore.getIfExists(task.tableId) == null)
                 {
-                    Collection<SSTableReader> newReaders = writer.finish(true);
-                    readers.addAll(newReaders);
-                    task.txn.update(newReaders, false);
+                    // schema was dropped during streaming
+                    task.receiver.abort();
+                    task.session.taskCompleted(task);
+                    return;
                 }
 
-                task.sstables.clear();
-
-                try (Refs<SSTableReader> refs = Refs.ref(readers))
-                {
-                    //We have a special path for Materialized view.
-                    //Since the MV requires cleaning up any pre-existing state, we must put
-                    //all partitions through the same write path as normal mutations.
-                    //This also ensures any 2is are also updated
-                    if (hasMaterializedViews)
-                    {
-                        for (SSTableReader reader : readers)
-                        {
-                            try (ISSTableScanner scanner = reader.getScanner())
-                            {
-                                while (scanner.hasNext())
-                                {
-                                    try (UnfilteredRowIterator rowIterator = scanner.next())
-                                    {
-                                        new Mutation(PartitionUpdate.fromIterator(rowIterator)).apply();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        task.txn.finish();
-
-                        // add sstables and build secondary indexes
-                        cfs.addSSTables(readers);
-                        cfs.indexManager.maybeBuildSecondaryIndexes(readers, cfs.indexManager.allIndexesNames());
-                    }
-                }
-                catch (Throwable t)
-                {
-                    logger.error("Error applying streamed sstable: ", t);
-
-                    JVMStabilityInspector.inspectThrowable(t);
-                }
-                finally
-                {
-                    //We don't keep the streamed sstables since we've applied them manually
-                    //So we abort the txn and delete the streamed sstables
-                    if (hasMaterializedViews)
-                        task.txn.abort();
-                }
+                task.receiver.finished();
+                task.session.taskCompleted(task);
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                task.session.onError(t);
             }
             finally
             {
-                task.session.taskCompleted(task);
+                task.receiver.cleanup();
             }
         }
     }
@@ -212,8 +156,6 @@ public class StreamReceiveTask extends StreamTask
             return;
 
         done = true;
-        sstables.forEach(SSTableMultiWriter::abortOrDie);
-        txn.abort();
-        sstables.clear();
+        receiver.abort();
     }
 }

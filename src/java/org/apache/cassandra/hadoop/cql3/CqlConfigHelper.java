@@ -19,7 +19,9 @@ package org.apache.cassandra.hadoop.cql3;
 * under the License.
 *
 */
-import java.io.FileInputStream;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.io.InputStream;
 import java.io.IOException;
 import java.security.KeyManagementException;
 import java.security.KeyStore;
@@ -40,6 +42,7 @@ import org.apache.commons.lang3.StringUtils;
 import com.datastax.driver.core.AuthProvider;
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.HostDistance;
+import com.datastax.driver.core.JdkSSLOptions;
 import com.datastax.driver.core.PlainTextAuthProvider;
 import com.datastax.driver.core.ProtocolVersion;
 import com.datastax.driver.core.policies.LoadBalancingPolicy;
@@ -85,7 +88,8 @@ public class CqlConfigHelper
 
     private static final String OUTPUT_CQL = "cassandra.output.cql";
     private static final String OUTPUT_NATIVE_PORT = "cassandra.output.native.port";
-    
+    private static final String ALLOW_SERVER_PORT_DISCOVERY = "cassandra.allowserverportdiscovery";
+
     /**
      * Set the CQL columns for the input of this job.
      *
@@ -96,10 +100,10 @@ public class CqlConfigHelper
     {
         if (columns == null || columns.isEmpty())
             return;
-        
+
         conf.set(INPUT_CQL_COLUMNS_CONFIG, columns);
     }
-    
+
     /**
      * Set the CQL query Limit for the input of this job.
      *
@@ -126,10 +130,10 @@ public class CqlConfigHelper
     {
         if (clauses == null || clauses.isEmpty())
             return;
-        
+
         conf.set(INPUT_CQL_WHERE_CLAUSE_CONFIG, clauses);
     }
-  
+
     /**
      * Set the CQL prepared statement for the output of this job.
      *
@@ -140,7 +144,7 @@ public class CqlConfigHelper
     {
         if (cql == null || cql.isEmpty())
             return;
-        
+
         conf.set(OUTPUT_CQL, cql);
     }
 
@@ -282,7 +286,8 @@ public class CqlConfigHelper
         return conf.get(OUTPUT_CQL);
     }
 
-    private static Optional<Integer> getProtocolVersion(Configuration conf) {
+    private static Optional<Integer> getProtocolVersion(Configuration conf)
+    {
         return getIntSetting(INPUT_NATIVE_PROTOCOL_VERSION, conf);
     }
 
@@ -329,7 +334,8 @@ public class CqlConfigHelper
         if (sslOptions.isPresent())
             builder.withSSL(sslOptions.get());
 
-        if (protocolVersion.isPresent()) {
+        if (protocolVersion.isPresent())
+        {
             builder.withProtocolVersion(ProtocolVersion.fromInt(protocolVersion.get()));
         }
         builder.withLoadBalancingPolicy(loadBalancingPolicy)
@@ -353,7 +359,7 @@ public class CqlConfigHelper
     public static void setInputMaxSimultReqPerConnections(Configuration conf, String reqs)
     {
         conf.set(INPUT_NATIVE_MAX_SIMULT_REQ_PER_CONNECTION, reqs);
-    }    
+    }
 
     public static void setInputNativeConnectionTimeout(Configuration conf, String timeout)
     {
@@ -393,7 +399,7 @@ public class CqlConfigHelper
     public static void setInputNativeSSLTruststorePath(Configuration conf, String path)
     {
         conf.set(INPUT_NATIVE_SSL_TRUST_STORE_PATH, path);
-    } 
+    }
 
     public static void setInputNativeSSLKeystorePath(Configuration conf, String path)
     {
@@ -445,11 +451,11 @@ public class CqlConfigHelper
             if (maxConnections.isPresent())
                 poolingOptions.setMaxConnectionsPerHost(hostDistance, maxConnections.get());
             if (maxSimultaneousRequests.isPresent())
-                poolingOptions.setMaxSimultaneousRequestsPerConnectionThreshold(hostDistance, maxSimultaneousRequests.get());
+                poolingOptions.setNewConnectionThreshold(hostDistance, maxSimultaneousRequests.get());
         }
 
         return poolingOptions;
-    }  
+    }
 
     private static QueryOptions getReadQueryOptions(Configuration conf)
     {
@@ -473,7 +479,7 @@ public class CqlConfigHelper
         Optional<Integer> sendBufferSize = getInputNativeSendBufferSize(conf);
         Optional<Integer> soLinger = getInputNativeSolinger(conf);
         Optional<Boolean> tcpNoDelay = getInputNativeTcpNodelay(conf);
-        Optional<Boolean> reuseAddress = getInputNativeReuseAddress(conf);       
+        Optional<Boolean> reuseAddress = getInputNativeReuseAddress(conf);
         Optional<Boolean> keepAlive = getInputNativeKeepAlive(conf);
 
         if (connectTimeoutMillis.isPresent())
@@ -491,7 +497,7 @@ public class CqlConfigHelper
         if (reuseAddress.isPresent())
             socketOptions.setReuseAddress(reuseAddress.get());
         if (keepAlive.isPresent())
-            socketOptions.setKeepAlive(keepAlive.get());     
+            socketOptions.setKeepAlive(keepAlive.get());
 
         return socketOptions;
     }
@@ -501,11 +507,26 @@ public class CqlConfigHelper
         return new LimitedLocalNodeFirstLocalBalancingPolicy(stickHosts);
     }
 
+    private static Optional<AuthProvider> getDefaultAuthProvider(Configuration conf)
+    {
+        Optional<String> username = getStringSetting(USERNAME, conf);
+        Optional<String> password = getStringSetting(PASSWORD, conf);
+
+        if (username.isPresent() && password.isPresent())
+        {
+            return Optional.of(new PlainTextAuthProvider(username.get(), password.get()));
+        }
+        else
+        {
+            return Optional.absent();
+        }
+    }
+
     private static Optional<AuthProvider> getAuthProvider(Configuration conf)
     {
         Optional<String> authProvider = getInputNativeAuthProvider(conf);
         if (!authProvider.isPresent())
-            return Optional.absent();
+            return getDefaultAuthProvider(conf);
 
         return Optional.of(getClientAuthProvider(authProvider.get(), conf));
     }
@@ -513,27 +534,31 @@ public class CqlConfigHelper
     public static Optional<SSLOptions> getSSLOptions(Configuration conf)
     {
         Optional<String> truststorePath = getInputNativeSSLTruststorePath(conf);
-        Optional<String> keystorePath = getInputNativeSSLKeystorePath(conf);
-        Optional<String> truststorePassword = getInputNativeSSLTruststorePassword(conf);
-        Optional<String> keystorePassword = getInputNativeSSLKeystorePassword(conf);
-        Optional<String> cipherSuites = getInputNativeSSLCipherSuites(conf);
-        
-        if (truststorePath.isPresent() && keystorePath.isPresent() && truststorePassword.isPresent() && keystorePassword.isPresent())
+
+        if (truststorePath.isPresent())
         {
+            Optional<String> keystorePath = getInputNativeSSLKeystorePath(conf);
+            Optional<String> truststorePassword = getInputNativeSSLTruststorePassword(conf);
+            Optional<String> keystorePassword = getInputNativeSSLKeystorePassword(conf);
+            Optional<String> cipherSuites = getInputNativeSSLCipherSuites(conf);
+
             SSLContext context;
             try
             {
-                context = getSSLContext(truststorePath.get(), truststorePassword.get(), keystorePath.get(), keystorePassword.get());
+                context = getSSLContext(truststorePath, truststorePassword, keystorePath, keystorePassword);
             }
             catch (UnrecoverableKeyException | KeyManagementException |
                     NoSuchAlgorithmException | KeyStoreException | CertificateException | IOException e)
             {
                 throw new RuntimeException(e);
             }
-            String[] css = SSLOptions.DEFAULT_SSL_CIPHER_SUITES;
+            String[] css = null;
             if (cipherSuites.isPresent())
                 css = cipherSuites.get().split(",");
-            return Optional.of(new SSLOptions(context,css));
+            return Optional.of(JdkSSLOptions.builder()
+                                            .withSSLContext(context)
+                                            .withCipherSuites(css)
+                                            .build());
         }
         return Optional.absent();
     }
@@ -543,7 +568,7 @@ public class CqlConfigHelper
         String setting = conf.get(parameter);
         if (setting == null)
             return Optional.absent();
-        return Optional.of(Integer.valueOf(setting));  
+        return Optional.of(Integer.valueOf(setting));
     }
 
     private static Optional<Boolean> getBooleanSetting(String parameter, Configuration conf)
@@ -551,7 +576,7 @@ public class CqlConfigHelper
         String setting = conf.get(parameter);
         if (setting == null)
             return Optional.absent();
-        return Optional.of(Boolean.valueOf(setting));  
+        return Optional.of(Boolean.valueOf(setting));
     }
 
     private static Optional<String> getStringSetting(String parameter, Configuration conf)
@@ -559,7 +584,7 @@ public class CqlConfigHelper
         String setting = conf.get(parameter);
         if (setting == null)
             return Optional.absent();
-        return Optional.of(setting);  
+        return Optional.of(setting);
     }
 
     private static AuthProvider getClientAuthProvider(String factoryClassName, Configuration conf)
@@ -585,26 +610,57 @@ public class CqlConfigHelper
         }
     }
 
-    private static SSLContext getSSLContext(String truststorePath, String truststorePassword, String keystorePath, String keystorePassword)
-            throws NoSuchAlgorithmException, KeyStoreException, CertificateException, IOException, UnrecoverableKeyException, KeyManagementException
+    private static SSLContext getSSLContext(Optional<String> truststorePath,
+                                            Optional<String> truststorePassword,
+                                            Optional<String> keystorePath,
+                                            Optional<String> keystorePassword)
+    throws NoSuchAlgorithmException,
+           KeyStoreException,
+           CertificateException,
+           IOException,
+           UnrecoverableKeyException,
+           KeyManagementException
     {
-        SSLContext ctx;
-        try (FileInputStream tsf = new FileInputStream(truststorePath); FileInputStream ksf = new FileInputStream(keystorePath))
+        SSLContext ctx = SSLContext.getInstance("SSL");
+
+        TrustManagerFactory tmf = null;
+        if (truststorePath.isPresent())
         {
-            ctx = SSLContext.getInstance("SSL");
-
-            KeyStore ts = KeyStore.getInstance("JKS");
-            ts.load(tsf, truststorePassword.toCharArray());
-            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-            tmf.init(ts);
-
-            KeyStore ks = KeyStore.getInstance("JKS");
-            ks.load(ksf, keystorePassword.toCharArray());
-            KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-            kmf.init(ks, keystorePassword.toCharArray());
-
-            ctx.init(kmf.getKeyManagers(), tmf.getTrustManagers(), new SecureRandom());
+            try (InputStream tsf = Files.newInputStream(Paths.get(truststorePath.get())))
+            {
+                KeyStore ts = KeyStore.getInstance("JKS");
+                ts.load(tsf, truststorePassword.isPresent() ? truststorePassword.get().toCharArray() : null);
+                tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+                tmf.init(ts);
+            }
         }
+
+        KeyManagerFactory kmf = null;
+        if (keystorePath.isPresent())
+        {
+            try (InputStream ksf = Files.newInputStream(Paths.get(keystorePath.get())))
+            {
+                KeyStore ks = KeyStore.getInstance("JKS");
+                ks.load(ksf, keystorePassword.isPresent() ? keystorePassword.get().toCharArray() : null);
+                kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+                kmf.init(ks, keystorePassword.isPresent() ? keystorePassword.get().toCharArray() : null);
+            }
+        }
+
+        ctx.init(kmf != null ? kmf.getKeyManagers() : null,
+                 tmf != null ? tmf.getTrustManagers() : null,
+                 new SecureRandom());
         return ctx;
     }
+
+    public static void setAllowServerPortDiscovery(Configuration conf, boolean allowServerPortDiscovery)
+    {
+        conf.set(ALLOW_SERVER_PORT_DISCOVERY, Boolean.toString(allowServerPortDiscovery));
+    }
+
+    public static boolean getAllowServerPortDiscovery(Configuration conf)
+    {
+        return Boolean.parseBoolean(conf.get(ALLOW_SERVER_PORT_DISCOVERY, "false"));
+    }
+
 }

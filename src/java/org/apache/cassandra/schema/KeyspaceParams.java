@@ -19,6 +19,8 @@ package org.apache.cassandra.schema;
 
 import java.util.Map;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 
 /**
@@ -27,6 +29,14 @@ import com.google.common.base.Objects;
 public final class KeyspaceParams
 {
     public static final boolean DEFAULT_DURABLE_WRITES = true;
+
+    /**
+     * This determines durable writes for the {@link org.apache.cassandra.schema.SchemaConstants#SCHEMA_KEYSPACE_NAME}
+     * and {@link org.apache.cassandra.schema.SchemaConstants#SYSTEM_KEYSPACE_NAME} keyspaces,
+     * the only reason it is not final is for commitlog unit tests. It should only be changed for testing purposes.
+     */
+    @VisibleForTesting
+    public static boolean DEFAULT_LOCAL_DURABLE_WRITES = true;
 
     public enum Option
     {
@@ -56,7 +66,7 @@ public final class KeyspaceParams
 
     public static KeyspaceParams local()
     {
-        return new KeyspaceParams(true, ReplicationParams.local());
+        return new KeyspaceParams(DEFAULT_LOCAL_DURABLE_WRITES, ReplicationParams.local());
     }
 
     public static KeyspaceParams simple(int replicationFactor)
@@ -64,9 +74,19 @@ public final class KeyspaceParams
         return new KeyspaceParams(true, ReplicationParams.simple(replicationFactor));
     }
 
+    public static KeyspaceParams simple(String replicationFactor)
+    {
+        return new KeyspaceParams(true, ReplicationParams.simple(replicationFactor));
+    }
+
     public static KeyspaceParams simpleTransient(int replicationFactor)
     {
         return new KeyspaceParams(false, ReplicationParams.simple(replicationFactor));
+    }
+
+    public static KeyspaceParams nts(Object... args)
+    {
+        return new KeyspaceParams(true, ReplicationParams.nts(args));
     }
 
     public void validate(String name)
@@ -97,9 +117,9 @@ public final class KeyspaceParams
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
-                      .add(Option.DURABLE_WRITES.toString(), durableWrites)
-                      .add(Option.REPLICATION.toString(), replication)
-                      .toString();
+        return MoreObjects.toStringHelper(this)
+                          .add(Option.DURABLE_WRITES.toString(), durableWrites)
+                          .add(Option.REPLICATION.toString(), replication)
+                          .toString();
     }
 }

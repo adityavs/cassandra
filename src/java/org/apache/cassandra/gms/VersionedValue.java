@@ -24,6 +24,7 @@ import java.util.UUID;
 
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.TypeSizes;
@@ -32,6 +33,7 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.commons.lang3.StringUtils;
@@ -64,6 +66,7 @@ public class VersionedValue implements Comparable<VersionedValue>
 
     // values for ApplicationState.STATUS
     public final static String STATUS_BOOTSTRAPPING = "BOOT";
+    public final static String STATUS_BOOTSTRAPPING_REPLACE = "BOOT_REPLACE";
     public final static String STATUS_NORMAL = "NORMAL";
     public final static String STATUS_LEAVING = "LEAVING";
     public final static String STATUS_LEFT = "LEFT";
@@ -108,6 +111,11 @@ public class VersionedValue implements Comparable<VersionedValue>
         return "Value(" + value + "," + version + ")";
     }
 
+    public byte[] toBytes()
+    {
+        return value.getBytes(ISO_8859_1);
+    }
+
     private static String versionString(String... args)
     {
         return StringUtils.join(args, VersionedValue.DELIMITER);
@@ -125,6 +133,17 @@ public class VersionedValue implements Comparable<VersionedValue>
         public VersionedValue cloneWithHigherVersion(VersionedValue value)
         {
             return new VersionedValue(value.value);
+        }
+
+        @Deprecated
+        public VersionedValue bootReplacing(InetAddress oldNode)
+        {
+            return new VersionedValue(versionString(VersionedValue.STATUS_BOOTSTRAPPING_REPLACE, oldNode.getHostAddress()));
+        }
+
+        public VersionedValue bootReplacingWithPort(InetAddressAndPort oldNode)
+        {
+            return new VersionedValue(versionString(VersionedValue.STATUS_BOOTSTRAPPING_REPLACE, oldNode.toString()));
         }
 
         public VersionedValue bootstrapping(Collection<Token> tokens)
@@ -237,9 +256,20 @@ public class VersionedValue implements Comparable<VersionedValue>
             return new VersionedValue(endpoint.getHostAddress());
         }
 
+        public VersionedValue nativeaddressAndPort(InetAddressAndPort address)
+        {
+            return new VersionedValue(address.toString());
+        }
+
         public VersionedValue releaseVersion()
         {
             return new VersionedValue(FBUtilities.getReleaseVersionString());
+        }
+
+        @VisibleForTesting
+        public VersionedValue releaseVersion(String version)
+        {
+            return new VersionedValue(version);
         }
 
         public VersionedValue networkVersion()
@@ -250,6 +280,11 @@ public class VersionedValue implements Comparable<VersionedValue>
         public VersionedValue internalIP(String private_ip)
         {
             return new VersionedValue(private_ip);
+        }
+
+        public VersionedValue internalAddressAndPort(InetAddressAndPort address)
+        {
+            return new VersionedValue(address.toString());
         }
 
         public VersionedValue severity(double value)

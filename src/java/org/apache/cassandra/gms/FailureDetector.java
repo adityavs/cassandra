@@ -17,23 +17,29 @@
  */
 package org.apache.cassandra.gms;
 
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.Path;
 import java.io.*;
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+import java.util.function.Predicate;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.*;
 
+import org.apache.cassandra.locator.Replica;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
 
 /**
  * This FailureDetector is an implementation of the paper titled
@@ -46,10 +52,11 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     public static final String MBEAN_NAME = "org.apache.cassandra.net:type=FailureDetector";
     private static final int SAMPLE_SIZE = 1000;
     protected static final long INITIAL_VALUE_NANOS = TimeUnit.NANOSECONDS.convert(getInitialValue(), TimeUnit.MILLISECONDS);
+    private static final int DEBUG_PERCENTAGE = 80; // if the phi is larger than this percentage of the max, log a debug message
     private static final long DEFAULT_MAX_PAUSE = 5000L * 1000000L; // 5 seconds
     private static final long MAX_LOCAL_PAUSE_IN_NANOS = getMaxLocalPause();
-    private long lastInterpret = System.nanoTime();
-    private boolean wasPaused = false;
+    private long lastInterpret = Clock.instance.nanoTime();
+    private long lastPause = 0L;
 
     private static long getMaxLocalPause()
     {
@@ -64,6 +71,8 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     }
 
     public static final IFailureDetector instance = new FailureDetector();
+    public static final Predicate<InetAddressAndPort> isEndpointAlive = instance::isAlive;
+    public static final Predicate<Replica> isReplicaAlive = r -> isEndpointAlive.test(r.endpoint());
 
     // this is useless except to provide backwards compatibility in phi_convict_threshold,
     // because everyone seems pretty accustomed to the default of 8, and users who have
@@ -71,21 +80,13 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     // change.
     private final double PHI_FACTOR = 1.0 / Math.log(10.0); // 0.434...
 
-    private final Map<InetAddress, ArrivalWindow> arrivalSamples = new Hashtable<InetAddress, ArrivalWindow>();
-    private final List<IFailureDetectionEventListener> fdEvntListeners = new CopyOnWriteArrayList<IFailureDetectionEventListener>();
+    private final ConcurrentHashMap<InetAddressAndPort, ArrivalWindow> arrivalSamples = new ConcurrentHashMap<>();
+    private final List<IFailureDetectionEventListener> fdEvntListeners = new CopyOnWriteArrayList<>();
 
     public FailureDetector()
     {
         // Register this instance with JMX
-        try
-        {
-            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
     }
 
     private static long getInitialValue()
@@ -104,10 +105,20 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 
     public String getAllEndpointStates()
     {
+        return getAllEndpointStates(false);
+    }
+
+    public String getAllEndpointStatesWithPort()
+    {
+        return getAllEndpointStates(true);
+    }
+
+    public String getAllEndpointStates(boolean withPort)
+    {
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<InetAddress, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
+        for (Map.Entry<InetAddressAndPort, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
         {
-            sb.append(entry.getKey()).append("\n");
+            sb.append(entry.getKey().toString(withPort)).append("\n");
             appendEndpointState(sb, entry.getValue());
         }
         return sb.toString();
@@ -115,13 +126,23 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 
     public Map<String, String> getSimpleStates()
     {
+        return getSimpleStates(false);
+    }
+
+    public Map<String, String> getSimpleStatesWithPort()
+    {
+        return getSimpleStates(true);
+    }
+
+    private Map<String, String> getSimpleStates(boolean withPort)
+    {
         Map<String, String> nodesStatus = new HashMap<String, String>(Gossiper.instance.endpointStateMap.size());
-        for (Map.Entry<InetAddress, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
+        for (Map.Entry<InetAddressAndPort, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
         {
             if (entry.getValue().isAlive())
-                nodesStatus.put(entry.getKey().toString(), "UP");
+                nodesStatus.put(entry.getKey().toString(withPort), "UP");
             else
-                nodesStatus.put(entry.getKey().toString(), "DOWN");
+                nodesStatus.put(entry.getKey().toString(withPort), "DOWN");
         }
         return nodesStatus;
     }
@@ -129,7 +150,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     public int getDownEndpointCount()
     {
         int count = 0;
-        for (Map.Entry<InetAddress, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
+        for (Map.Entry<InetAddressAndPort, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
         {
             if (!entry.getValue().isAlive())
                 count++;
@@ -140,7 +161,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     public int getUpEndpointCount()
     {
         int count = 0;
-        for (Map.Entry<InetAddress, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
+        for (Map.Entry<InetAddressAndPort, EndpointState> entry : Gossiper.instance.endpointStateMap.entrySet())
         {
             if (entry.getValue().isAlive())
                 count++;
@@ -148,10 +169,49 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         return count;
     }
 
+    @Override
+    public TabularData getPhiValues() throws OpenDataException
+    {
+        return getPhiValues(false);
+    }
+
+    @Override
+    public TabularData getPhiValuesWithPort() throws OpenDataException
+    {
+        return getPhiValues(true);
+    }
+
+    private TabularData getPhiValues(boolean withPort) throws OpenDataException
+    {
+        final CompositeType ct = new CompositeType("Node", "Node",
+                new String[]{"Endpoint", "PHI"},
+                new String[]{"IP of the endpoint", "PHI value"},
+                new OpenType[]{SimpleType.STRING, SimpleType.DOUBLE});
+        final TabularDataSupport results = new TabularDataSupport(new TabularType("PhiList", "PhiList", ct, new String[]{"Endpoint"}));
+
+        for (final Map.Entry<InetAddressAndPort, ArrivalWindow> entry : arrivalSamples.entrySet())
+        {
+            final ArrivalWindow window = entry.getValue();
+            if (window.mean() > 0)
+            {
+                final double phi = window.getLastReportedPhi();
+                if (phi != Double.MIN_VALUE)
+                {
+                    // returned values are scaled by PHI_FACTOR so that the are on the same scale as PhiConvictThreshold
+                    final CompositeData data = new CompositeDataSupport(ct,
+                            new String[]{"Endpoint", "PHI"},
+                            new Object[]{entry.getKey().toString(withPort), phi * PHI_FACTOR});
+                    results.put(data);
+                }
+            }
+        }
+        return results;
+    }
+
     public String getEndpointState(String address) throws UnknownHostException
     {
         StringBuilder sb = new StringBuilder();
-        EndpointState endpointState = Gossiper.instance.getEndpointStateForEndpoint(InetAddress.getByName(address));
+        EndpointState endpointState = Gossiper.instance.getEndpointStateForEndpoint(InetAddressAndPort.getByName(address));
         appendEndpointState(sb, endpointState);
         return sb.toString();
     }
@@ -160,11 +220,20 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     {
         sb.append("  generation:").append(endpointState.getHeartBeatState().getGeneration()).append("\n");
         sb.append("  heartbeat:").append(endpointState.getHeartBeatState().getHeartBeatVersion()).append("\n");
-        for (Map.Entry<ApplicationState, VersionedValue> state : endpointState.applicationState.entrySet())
+        for (Map.Entry<ApplicationState, VersionedValue> state : endpointState.states())
         {
             if (state.getKey() == ApplicationState.TOKENS)
                 continue;
-            sb.append("  ").append(state.getKey()).append(":").append(state.getValue().value).append("\n");
+            sb.append("  ").append(state.getKey()).append(":").append(state.getValue().version).append(":").append(state.getValue().value).append("\n");
+        }
+        VersionedValue tokens = endpointState.getApplicationState(ApplicationState.TOKENS);
+        if (tokens != null)
+        {
+            sb.append("  TOKENS:").append(tokens.version).append(":<hidden>\n");
+        }
+        else
+        {
+            sb.append("  TOKENS: not present\n");
         }
     }
 
@@ -173,15 +242,18 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
      */
     public void dumpInterArrivalTimes()
     {
-        File file = FileUtils.createTempFile("failuredetector-", ".dat");
+        Path path = null;
+        try {
+            path = Files.createTempFile("failuredetector-", ".dat");
 
-        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(file, true)))
-        {
-            os.write(toString().getBytes());
+            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(path, StandardOpenOption.APPEND)))
+            {
+                os.write(toString().getBytes());
+            }
         }
         catch (IOException e)
         {
-            throw new FSWriteError(e, file);
+            throw new FSWriteError(e, (path == null) ? null : path.toFile());
         }
     }
 
@@ -195,9 +267,9 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         return DatabaseDescriptor.getPhiConvictThreshold();
     }
 
-    public boolean isAlive(InetAddress ep)
+    public boolean isAlive(InetAddressAndPort ep)
     {
-        if (ep.equals(FBUtilities.getBroadcastAddress()))
+        if (ep.equals(FBUtilities.getBroadcastAddressAndPort()))
             return true;
 
         EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(ep);
@@ -205,48 +277,51 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         // it's worth being defensive here so minor bugs don't cause disproportionate
         // badness.  (See CASSANDRA-1463 for an example).
         if (epState == null)
-            logger.error("unknown endpoint {}", ep);
+            logger.error("Unknown endpoint: " + ep, new IllegalArgumentException(""));
         return epState != null && epState.isAlive();
     }
 
-    public void report(InetAddress ep)
+    public void report(InetAddressAndPort ep)
     {
-        if (logger.isTraceEnabled())
-            logger.trace("reporting {}", ep);
-        long now = System.nanoTime();
+        long now = Clock.instance.nanoTime();
         ArrivalWindow heartbeatWindow = arrivalSamples.get(ep);
         if (heartbeatWindow == null)
         {
             // avoid adding an empty ArrivalWindow to the Map
             heartbeatWindow = new ArrivalWindow(SAMPLE_SIZE);
             heartbeatWindow.add(now, ep);
-            arrivalSamples.put(ep, heartbeatWindow);
+            heartbeatWindow = arrivalSamples.putIfAbsent(ep, heartbeatWindow);
+            if (heartbeatWindow != null)
+                heartbeatWindow.add(now, ep);
         }
         else
         {
             heartbeatWindow.add(now, ep);
         }
+
+        if (logger.isTraceEnabled() && heartbeatWindow != null)
+            logger.trace("Average for {} is {}ns", ep, heartbeatWindow.mean());
     }
 
-    public void interpret(InetAddress ep)
+    public void interpret(InetAddressAndPort ep)
     {
         ArrivalWindow hbWnd = arrivalSamples.get(ep);
         if (hbWnd == null)
         {
             return;
         }
-        long now = System.nanoTime();
+        long now = Clock.instance.nanoTime();
         long diff = now - lastInterpret;
         lastInterpret = now;
         if (diff > MAX_LOCAL_PAUSE_IN_NANOS)
         {
-            logger.warn("Not marking nodes down due to local pause of {} > {}", diff, MAX_LOCAL_PAUSE_IN_NANOS);
-            wasPaused = true;
+            logger.warn("Not marking nodes down due to local pause of {}ns > {}ns", diff, MAX_LOCAL_PAUSE_IN_NANOS);
+            lastPause = now;
             return;
         }
-        if (wasPaused)
+        if (Clock.instance.nanoTime() - lastPause < MAX_LOCAL_PAUSE_IN_NANOS)
         {
-            wasPaused = false;
+            logger.debug("Still not marking nodes down due to local pause");
             return;
         }
         double phi = hbWnd.phi(now);
@@ -255,16 +330,25 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 
         if (PHI_FACTOR * phi > getPhiConvictThreshold())
         {
-            logger.trace("notifying listeners that {} is down", ep);
-            logger.trace("intervals: {} mean: {}", hbWnd, hbWnd.mean());
+            if (logger.isTraceEnabled())
+                logger.trace("Node {} phi {} > {}; intervals: {} mean: {}ns", new Object[]{ep, PHI_FACTOR * phi, getPhiConvictThreshold(), hbWnd, hbWnd.mean()});
             for (IFailureDetectionEventListener listener : fdEvntListeners)
             {
                 listener.convict(ep, phi);
             }
         }
+        else if (logger.isDebugEnabled() && (PHI_FACTOR * phi * DEBUG_PERCENTAGE / 100.0 > getPhiConvictThreshold()))
+        {
+            logger.debug("PHI for {} : {}", ep, phi);
+        }
+        else if (logger.isTraceEnabled())
+        {
+            logger.trace("PHI for {} : {}", ep, phi);
+            logger.trace("mean for {} : {}ns", ep, hbWnd.mean());
+        }
     }
 
-    public void forceConviction(InetAddress ep)
+    public void forceConviction(InetAddressAndPort ep)
     {
         logger.debug("Forcing conviction of {}", ep);
         for (IFailureDetectionEventListener listener : fdEvntListeners)
@@ -273,7 +357,7 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
         }
     }
 
-    public void remove(InetAddress ep)
+    public void remove(InetAddressAndPort ep)
     {
         arrivalSamples.remove(ep);
     }
@@ -291,22 +375,18 @@ public class FailureDetector implements IFailureDetector, FailureDetectorMBean
     public String toString()
     {
         StringBuilder sb = new StringBuilder();
-        Set<InetAddress> eps = arrivalSamples.keySet();
+        Set<InetAddressAndPort> eps = arrivalSamples.keySet();
 
         sb.append("-----------------------------------------------------------------------");
-        for (InetAddress ep : eps)
+        for (InetAddressAndPort ep : eps)
         {
             ArrivalWindow hWnd = arrivalSamples.get(ep);
-            sb.append(ep + " : ");
+            sb.append(ep).append(" : ");
             sb.append(hWnd);
             sb.append(System.getProperty("line.separator"));
         }
         sb.append("-----------------------------------------------------------------------");
         return sb.toString();
-    }
-
-    public static void main(String[] args)
-    {
     }
 }
 
@@ -364,12 +444,7 @@ class ArrivalWindow
     private static final Logger logger = LoggerFactory.getLogger(ArrivalWindow.class);
     private long tLast = 0L;
     private final ArrayBackedBoundedStats arrivalIntervals;
-
-    // this is useless except to provide backwards compatibility in phi_convict_threshold,
-    // because everyone seems pretty accustomed to the default of 8, and users who have
-    // already tuned their phi_convict_threshold for their own environments won't need to
-    // change.
-    private final double PHI_FACTOR = 1.0 / Math.log(10.0);
+    private double lastReportedPhi = Double.MIN_VALUE;
 
     // in the event of a long partition, never record an interval longer than the rpc timeout,
     // since if a host is regularly experiencing connectivity problems lasting this long we'd
@@ -396,16 +471,21 @@ class ArrivalWindow
         }
     }
 
-    synchronized void add(long value, InetAddress ep)
+    synchronized void add(long value, InetAddressAndPort ep)
     {
         assert tLast >= 0;
         if (tLast > 0L)
         {
             long interArrivalTime = (value - tLast);
             if (interArrivalTime <= MAX_INTERVAL_IN_NANO)
+            {
                 arrivalIntervals.add(interArrivalTime);
+                logger.trace("Reporting interval time of {}ns for {}", interArrivalTime, ep);
+            }
             else
-                logger.debug("Ignoring interval time of {} for {}", interArrivalTime, ep);
+            {
+                logger.trace("Ignoring interval time of {}ns for {}", interArrivalTime, ep);
+            }
         }
         else
         {
@@ -427,7 +507,13 @@ class ArrivalWindow
     {
         assert arrivalIntervals.mean() > 0 && tLast > 0; // should not be called before any samples arrive
         long t = tnow - tLast;
-        return t / mean();
+        lastReportedPhi = t / mean();
+        return lastReportedPhi;
+    }
+
+    double getLastReportedPhi()
+    {
+        return lastReportedPhi;
     }
 
     public String toString()

@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.service;
 
+import java.io.IOException;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryUsage;
@@ -27,33 +28,41 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import javax.management.InstanceAlreadyExistsException;
+import javax.management.MBeanRegistrationException;
 import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
+import javax.management.NotCompliantMBeanException;
 import javax.management.Notification;
 import javax.management.NotificationListener;
 import javax.management.ObjectName;
 import javax.management.openmbean.CompositeData;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.sun.management.GarbageCollectionNotificationInfo;
 import com.sun.management.GcInfo;
 
-import org.apache.cassandra.db.lifecycle.TransactionLog;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.utils.StatusLogger;
 
 public class GCInspector implements NotificationListener, GCInspectorMXBean
 {
     public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
-    final static long MIN_LOG_DURATION = 200;
-    final static long MIN_LOG_DURATION_TPSTATS = 1000;
+    private volatile long gcLogThreshholdInMs = DatabaseDescriptor.getGCLogThreshold();
+    private volatile long gcWarnThreasholdInMs = DatabaseDescriptor.getGCWarnThreshold();
+
     /*
      * The field from java.nio.Bits that tracks the total number of allocated
      * bytes of direct memory requires via ByteBuffer.allocateDirect that have not been GCed.
      */
     final static Field BITS_TOTAL_CAPACITY;
 
+    
     static
     {
         Field temp = null;
@@ -142,10 +151,12 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
                 GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(mbs, name.getCanonicalName(), GarbageCollectorMXBean.class);
                 gcStates.put(gc.getName(), new GCState(gc, assumeGCIsPartiallyConcurrent(gc), assumeGCIsOldGen(gc)));
             }
-
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+            ObjectName me = new ObjectName(MBEAN_NAME);
+            if (!mbs.isRegistered(me))
+                mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
         }
-        catch (Exception e)
+        catch (RuntimeException | InstanceAlreadyExistsException | MBeanRegistrationException | 
+                NotCompliantMBeanException | MalformedObjectNameException | IOException e)
         {
             throw new RuntimeException(e);
         }
@@ -272,19 +283,20 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
                 if (state.compareAndSet(prev, new State(duration, bytes, prev)))
                     break;
             }
+            
+            if (gcWarnThreasholdInMs != 0 && duration > gcWarnThreasholdInMs)
+                logger.warn(sb.toString());
+            else if (duration > gcLogThreshholdInMs)
+                logger.info(sb.toString());
+            else if (logger.isTraceEnabled())
+                logger.trace(sb.toString());
 
-            String st = sb.toString();
-            if (duration > MIN_LOG_DURATION)
-                logger.info(st);
-            else if (logger.isDebugEnabled())
-                logger.debug(st);
-
-            if (duration > MIN_LOG_DURATION_TPSTATS)
+            if (duration > this.getStatusThresholdInMs())
                 StatusLogger.log();
 
             // if we just finished an old gen collection and we're still using a lot of memory, try to reduce the pressure
             if (gcState.assumeGCIsOldGen)
-                TransactionLog.rescheduleFailedDeletions();
+                LifecycleTransaction.rescheduleFailedDeletions();
         }
     }
 
@@ -322,4 +334,40 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
             return -1;
         }
     }
+
+    public void setGcWarnThresholdInMs(long threshold)
+    {
+        if (threshold < 0)
+            throw new IllegalArgumentException("Threshold must be greater than or equal to 0");
+        if (threshold != 0 && threshold <= gcLogThreshholdInMs)
+            throw new IllegalArgumentException("Threshold must be greater than gcLogTreasholdInMs which is currently " 
+                    + gcLogThreshholdInMs);
+        gcWarnThreasholdInMs = threshold;
+    }
+
+    public long getGcWarnThresholdInMs()
+    {
+        return gcWarnThreasholdInMs;
+    }
+
+    public void setGcLogThresholdInMs(long threshold)
+    {
+        if (threshold <= 0)
+            throw new IllegalArgumentException("Threashold must be greater than 0");
+        if (gcWarnThreasholdInMs != 0 && threshold > gcWarnThreasholdInMs)
+            throw new IllegalArgumentException("Threashold must be less than gcWarnTreasholdInMs which is currently " 
+                    + gcWarnThreasholdInMs);
+        gcLogThreshholdInMs = threshold;
+    }
+
+    public long getGcLogThresholdInMs()
+    {
+        return gcLogThreshholdInMs;
+    }
+
+    public long getStatusThresholdInMs()
+    {
+        return gcWarnThreasholdInMs != 0 ? gcWarnThreasholdInMs : gcLogThreshholdInMs;
+    }
+
 }

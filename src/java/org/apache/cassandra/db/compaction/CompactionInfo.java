@@ -20,39 +20,71 @@ package org.apache.cassandra.db.compaction;
 import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.metrics.StorageMetrics;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.schema.TableMetadata;
 
 /** Implements serializable to allow structured info to be returned via JMX. */
 public final class CompactionInfo implements Serializable
 {
     private static final long serialVersionUID = 3695381572726744816L;
-    private final CFMetaData cfm;
+
+    public static final String ID = "id";
+    public static final String KEYSPACE = "keyspace";
+    public static final String COLUMNFAMILY = "columnfamily";
+    public static final String COMPLETED = "completed";
+    public static final String TOTAL = "total";
+    public static final String TASK_TYPE = "taskType";
+    public static final String UNIT = "unit";
+    public static final String COMPACTION_ID = "compactionId";
+
+    private final TableMetadata metadata;
     private final OperationType tasktype;
     private final long completed;
     private final long total;
-    private final String unit;
+    private final Unit unit;
     private final UUID compactionId;
 
-    public CompactionInfo(CFMetaData cfm, OperationType tasktype, long bytesComplete, long totalBytes, UUID compactionId)
+    public CompactionInfo(TableMetadata metadata, OperationType tasktype, long bytesComplete, long totalBytes, UUID compactionId)
     {
-        this(cfm, tasktype, bytesComplete, totalBytes, "bytes", compactionId);
+        this(metadata, tasktype, bytesComplete, totalBytes, Unit.BYTES, compactionId);
     }
 
-    public CompactionInfo(OperationType tasktype, long completed, long total, String unit, UUID compactionId)
+    public static enum Unit
+    {
+        BYTES("bytes"), RANGES("token range parts"), KEYS("keys");
+
+        private final String name;
+
+        private Unit(String name)
+        {
+            this.name = name;
+        }
+
+        @Override
+        public String toString()
+        {
+            return this.name;
+        }
+
+        public static boolean isFileSize(String unit)
+        {
+            return BYTES.toString().equals(unit);
+        }
+    }
+
+    public CompactionInfo(OperationType tasktype, long completed, long total, Unit unit, UUID compactionId)
     {
         this(null, tasktype, completed, total, unit, compactionId);
     }
 
-    public CompactionInfo(CFMetaData cfm, OperationType tasktype, long completed, long total, String unit, UUID compactionId)
+    public CompactionInfo(TableMetadata metadata, OperationType tasktype, long completed, long total, Unit unit, UUID compactionId)
     {
         this.tasktype = tasktype;
         this.completed = completed;
         this.total = total;
-        this.cfm = cfm;
+        this.metadata = metadata;
         this.unit = unit;
         this.compactionId = compactionId;
     }
@@ -60,27 +92,22 @@ public final class CompactionInfo implements Serializable
     /** @return A copy of this CompactionInfo with updated progress. */
     public CompactionInfo forProgress(long complete, long total)
     {
-        return new CompactionInfo(cfm, tasktype, complete, total, unit, compactionId);
+        return new CompactionInfo(metadata, tasktype, complete, total, unit, compactionId);
     }
 
-    public UUID getId()
+    public Optional<String> getKeyspace()
     {
-        return cfm.cfId;
+        return Optional.ofNullable(metadata != null ? metadata.keyspace : null);
     }
 
-    public String getKeyspace()
+    public Optional<String> getTable()
     {
-        return cfm.ksName;
+        return Optional.ofNullable(metadata != null ? metadata.name : null);
     }
 
-    public String getColumnFamily()
+    public TableMetadata getTableMetadata()
     {
-        return cfm.cfName;
-    }
-
-    public CFMetaData getCFMetaData()
-    {
-        return cfm;
+        return metadata;
     }
 
     public long getCompleted()
@@ -98,31 +125,44 @@ public final class CompactionInfo implements Serializable
         return tasktype;
     }
 
-    public UUID compactionId()
+    public UUID getTaskId()
     {
         return compactionId;
+    }
+
+    public Unit getUnit()
+    {
+        return unit;
     }
 
     public String toString()
     {
         StringBuilder buff = new StringBuilder();
-        buff.append(getTaskType()).append('@').append(getId());
-        buff.append('(').append(getKeyspace()).append(", ").append(getColumnFamily());
-        buff.append(", ").append(getCompleted()).append('/').append(getTotal());
+        buff.append(getTaskType());
+        if (metadata != null)
+        {
+            buff.append('@').append(metadata.id).append('(');
+            buff.append(metadata.keyspace).append(", ").append(metadata.name).append(", ");
+        }
+        else
+        {
+            buff.append('(');
+        }
+        buff.append(getCompleted()).append('/').append(getTotal());
         return buff.append(')').append(unit).toString();
     }
 
     public Map<String, String> asMap()
     {
         Map<String, String> ret = new HashMap<String, String>();
-        ret.put("id", getId() == null ? "" : getId().toString());
-        ret.put("keyspace", getKeyspace());
-        ret.put("columnfamily", getColumnFamily());
-        ret.put("completed", Long.toString(completed));
-        ret.put("total", Long.toString(total));
-        ret.put("taskType", tasktype.toString());
-        ret.put("unit", unit);
-        ret.put("compactionId", compactionId == null ? "" : compactionId.toString());
+        ret.put(ID, metadata != null ? metadata.id.toString() : "");
+        ret.put(KEYSPACE, getKeyspace().orElse(null));
+        ret.put(COLUMNFAMILY, getTable().orElse(null));
+        ret.put(COMPLETED, Long.toString(completed));
+        ret.put(TOTAL, Long.toString(total));
+        ret.put(TASK_TYPE, tasktype.toString());
+        ret.put(UNIT, unit.toString());
+        ret.put(COMPACTION_ID, compactionId == null ? "" : compactionId.toString());
         return ret;
     }
 
@@ -130,8 +170,6 @@ public final class CompactionInfo implements Serializable
     {
         private volatile boolean stopRequested = false;
         public abstract CompactionInfo getCompactionInfo();
-        double load = StorageMetrics.load.getCount();
-        double reportedSeverity = 0d;
 
         public void stop()
         {
@@ -141,24 +179,6 @@ public final class CompactionInfo implements Serializable
         public boolean isStopRequested()
         {
             return stopRequested;
-        }
-        /**
-         * report event on the size of the compaction.
-         */
-        public void started()
-        {
-            reportedSeverity = getCompactionInfo().getTotal() / load;
-            StorageService.instance.reportSeverity(reportedSeverity);
-        }
-
-        /**
-         * remove the event complete
-         */
-        public void finished()
-        {
-            if (reportedSeverity != 0d)
-                StorageService.instance.reportSeverity(-(reportedSeverity));
-            reportedSeverity = 0d;
         }
     }
 }

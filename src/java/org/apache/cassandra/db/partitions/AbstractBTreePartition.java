@@ -20,46 +20,44 @@ package org.apache.cassandra.db.partitions;
 
 import java.util.Iterator;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
-import org.apache.cassandra.utils.btree.BTreeSearchIterator;
 
 import static org.apache.cassandra.utils.btree.BTree.Dir.desc;
 
 public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
 {
-    protected static final Holder EMPTY = new Holder(BTree.empty(), DeletionInfo.LIVE, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+    protected static final Holder EMPTY = new Holder(RegularAndStaticColumns.NONE, BTree.empty(), DeletionInfo.LIVE, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
 
-    protected final CFMetaData metadata;
     protected final DecoratedKey partitionKey;
-    protected final PartitionColumns columns;
+
     protected abstract Holder holder();
     protected abstract boolean canHaveShadowedData();
 
-    protected AbstractBTreePartition(CFMetaData metadata, DecoratedKey partitionKey, PartitionColumns columns)
+    protected AbstractBTreePartition(DecoratedKey partitionKey)
     {
-        this.metadata = metadata;
         this.partitionKey = partitionKey;
-        this.columns = columns;
     }
 
     protected static final class Holder
     {
+        final RegularAndStaticColumns columns;
         final DeletionInfo deletionInfo;
         // the btree of rows
         final Object[] tree;
         final Row staticRow;
         final EncodingStats stats;
 
-        Holder(Object[] tree, DeletionInfo deletionInfo, Row staticRow, EncodingStats stats)
+        Holder(RegularAndStaticColumns columns, Object[] tree, DeletionInfo deletionInfo, Row staticRow, EncodingStats stats)
         {
+            this.columns = columns;
             this.tree = tree;
             this.deletionInfo = deletionInfo;
-            this.staticRow = staticRow;
+            this.staticRow = staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow;
             this.stats = stats;
         }
     }
@@ -86,10 +84,7 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         return !BTree.isEmpty(holder.tree);
     }
 
-    public CFMetaData metadata()
-    {
-        return metadata;
-    }
+    public abstract TableMetadata metadata();
 
     public DecoratedKey partitionKey()
     {
@@ -98,13 +93,12 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
 
     public DeletionTime partitionLevelDeletion()
     {
-        return holder().deletionInfo.getPartitionDeletion();
+        return deletionInfo().getPartitionDeletion();
     }
 
-    public PartitionColumns columns()
+    public RegularAndStaticColumns columns()
     {
-        // We don't really know which columns will be part of the update, so assume it's all of them
-        return metadata.partitionColumns();
+        return holder().columns;
     }
 
     public EncodingStats stats()
@@ -126,7 +120,7 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         if (columns.fetchedColumns().statics.isEmpty() || (current.staticRow.isEmpty() && partitionDeletion.isLive()))
             return Rows.EMPTY_STATIC_ROW;
 
-        Row row = current.staticRow.filter(columns, partitionDeletion, setActiveDeletionToRow, metadata);
+        Row row = current.staticRow.filter(columns, partitionDeletion, setActiveDeletionToRow, metadata());
         return row == null ? Rows.EMPTY_STATIC_ROW : row;
     }
 
@@ -136,13 +130,8 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         final Holder current = holder();
         return new SearchIterator<Clustering, Row>()
         {
-            private final SearchIterator<Clustering, Row> rawIter = new BTreeSearchIterator<>(current.tree, metadata.comparator, desc(reversed));
+            private final SearchIterator<Clustering, Row> rawIter = BTree.slice(current.tree, metadata().comparator, desc(reversed));
             private final DeletionTime partitionDeletion = current.deletionInfo.getPartitionDeletion();
-
-            public boolean hasNext()
-            {
-                return rawIter.hasNext();
-            }
 
             public Row next(Clustering clustering)
             {
@@ -160,16 +149,16 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
                     activeDeletion = rt.deletionTime();
 
                 if (row == null)
-                    return activeDeletion.isLive() ? null : BTreeRow.emptyDeletedRow(clustering, activeDeletion);
+                    return activeDeletion.isLive() ? null : BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(activeDeletion));
 
-                return row.filter(columns, activeDeletion, true, metadata);
+                return row.filter(columns, activeDeletion, true, metadata());
             }
         };
     }
 
     public UnfilteredRowIterator unfilteredIterator()
     {
-        return unfilteredIterator(ColumnFilter.all(metadata()), Slices.ALL, false);
+        return unfilteredIterator(ColumnFilter.selection(columns()), Slices.ALL, false);
     }
 
     public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, Slices slices, boolean reversed)
@@ -183,7 +172,7 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         if (slices.size() == 0)
         {
             DeletionTime partitionDeletion = current.deletionInfo.getPartitionDeletion();
-            return UnfilteredRowIterators.noRowsIterator(metadata, partitionKey, staticRow, partitionDeletion, reversed);
+            return UnfilteredRowIterators.noRowsIterator(metadata(), partitionKey(), staticRow, partitionDeletion, reversed);
         }
 
         return slices.size() == 1
@@ -193,18 +182,17 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
 
     private UnfilteredRowIterator sliceIterator(ColumnFilter selection, Slice slice, boolean reversed, Holder current, Row staticRow)
     {
-        Slice.Bound start = slice.start() == Slice.Bound.BOTTOM ? null : slice.start();
-        Slice.Bound end = slice.end() == Slice.Bound.TOP ? null : slice.end();
-        Iterator<Row> rowIter = BTree.slice(current.tree, metadata.comparator, start, true, end, true, desc(reversed));
+        ClusteringBound start = slice.start() == ClusteringBound.BOTTOM ? null : slice.start();
+        ClusteringBound end = slice.end() == ClusteringBound.TOP ? null : slice.end();
+        Iterator<Row> rowIter = BTree.slice(current.tree, metadata().comparator, start, true, end, true, desc(reversed));
         Iterator<RangeTombstone> deleteIter = current.deletionInfo.rangeIterator(slice, reversed);
-
         return merge(rowIter, deleteIter, selection, reversed, current, staticRow);
     }
 
     private RowAndDeletionMergeIterator merge(Iterator<Row> rowIter, Iterator<RangeTombstone> deleteIter,
-                                                     ColumnFilter selection, boolean reversed, Holder current, Row staticRow)
+                                              ColumnFilter selection, boolean reversed, Holder current, Row staticRow)
     {
-        return new RowAndDeletionMergeIterator(metadata, partitionKey, current.deletionInfo.getPartitionDeletion(),
+        return new RowAndDeletionMergeIterator(metadata(), partitionKey(), current.deletionInfo.getPartitionDeletion(),
                                                selection, staticRow, reversed, current.stats,
                                                rowIter, deleteIter,
                                                canHaveShadowedData());
@@ -215,24 +203,14 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         final Holder current;
         final ColumnFilter selection;
 
-        private AbstractIterator(ColumnFilter selection, boolean isReversed)
-        {
-            this(AbstractBTreePartition.this.holder(), selection, isReversed);
-        }
-
-        private AbstractIterator(Holder current, ColumnFilter selection, boolean isReversed)
-        {
-            this(current,
-                 AbstractBTreePartition.this.staticRow(current, selection, false),
-                 selection, isReversed);
-        }
-
         private AbstractIterator(Holder current, Row staticRow, ColumnFilter selection, boolean isReversed)
         {
-            super(AbstractBTreePartition.this.metadata,
-                  AbstractBTreePartition.this.partitionKey,
+            super(AbstractBTreePartition.this.metadata(),
+                  AbstractBTreePartition.this.partitionKey(),
                   current.deletionInfo.getPartitionDeletion(),
-                  AbstractBTreePartition.this.columns,
+                  selection.fetchedColumns(), // non-selected columns will be filtered in subclasses by RowAndDeletionMergeIterator
+                                              // it would also be more precise to return the intersection of the selection and current.columns,
+                                              // but its probably not worth spending time on computing that.
                   staticRow,
                   isReversed,
                   current.stats);
@@ -280,47 +258,19 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         }
     }
 
-    public class SliceableIterator extends AbstractIterator implements SliceableUnfilteredRowIterator
-    {
-        private Iterator<Unfiltered> iterator;
-
-        protected SliceableIterator(ColumnFilter selection, boolean isReversed)
-        {
-            super(selection, isReversed);
-        }
-
-        protected Unfiltered computeNext()
-        {
-            if (iterator == null)
-                iterator = unfilteredIterator(selection, Slices.ALL, isReverseOrder);
-            if (!iterator.hasNext())
-                return endOfData();
-            return iterator.next();
-        }
-
-        public Iterator<Unfiltered> slice(Slice slice)
-        {
-            return sliceIterator(selection, slice, isReverseOrder, current, staticRow);
-        }
-    }
-
-    public SliceableUnfilteredRowIterator sliceableUnfilteredIterator(ColumnFilter columns, boolean reversed)
-    {
-        return new SliceableIterator(columns, reversed);
-    }
-
-    protected SliceableUnfilteredRowIterator sliceableUnfilteredIterator()
-    {
-        return sliceableUnfilteredIterator(ColumnFilter.all(metadata), false);
-    }
-
     protected static Holder build(UnfilteredRowIterator iterator, int initialRowCapacity)
     {
-        CFMetaData metadata = iterator.metadata();
+        return build(iterator, initialRowCapacity, true);
+    }
+
+    protected static Holder build(UnfilteredRowIterator iterator, int initialRowCapacity, boolean ordered)
+    {
+        TableMetadata metadata = iterator.metadata();
+        RegularAndStaticColumns columns = iterator.columns();
         boolean reversed = iterator.isReverseOrder();
 
         BTree.Builder<Row> builder = BTree.builder(metadata.comparator, initialRowCapacity);
-        builder.auto(false);
+        builder.auto(!ordered);
         MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(iterator.partitionLevelDeletion(), metadata.comparator, reversed);
 
         while (iterator.hasNext())
@@ -335,31 +285,30 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         if (reversed)
             builder.reverse();
 
-        return new Holder(builder.build(), deletionBuilder.build(), iterator.staticRow(), iterator.stats());
+        return new Holder(columns, builder.build(), deletionBuilder.build(), iterator.staticRow(), iterator.stats());
     }
 
-    // live must (as the name suggests) not contain any deletion information
-    protected static Holder build(RowIterator rows, DeletionInfo live, boolean buildEncodingStats, int initialRowCapacity)
+    // Note that when building with a RowIterator, deletion will generally be LIVE, but we allow to pass it nonetheless because PartitionUpdate
+    // passes a MutableDeletionInfo that it mutates later.
+    protected static Holder build(RowIterator rows, DeletionInfo deletion, boolean buildEncodingStats, int initialRowCapacity)
     {
-        CFMetaData metadata = rows.metadata();
+        TableMetadata metadata = rows.metadata();
+        RegularAndStaticColumns columns = rows.columns();
         boolean reversed = rows.isReverseOrder();
 
         BTree.Builder<Row> builder = BTree.builder(metadata.comparator, initialRowCapacity);
         builder.auto(false);
         while (rows.hasNext())
-        {
-            Row row = rows.next();
-            builder.add(row);
-        }
+            builder.add(rows.next());
 
         if (reversed)
             builder.reverse();
 
         Row staticRow = rows.staticRow();
         Object[] tree = builder.build();
-        EncodingStats stats = buildEncodingStats ? EncodingStats.Collector.collect(staticRow, BTree.iterator(tree), live)
+        EncodingStats stats = buildEncodingStats ? EncodingStats.Collector.collect(staticRow, BTree.iterator(tree), deletion)
                                                  : EncodingStats.NO_STATS;
-        return new Holder(tree, live, staticRow, stats);
+        return new Holder(columns, tree, deletion, staticRow, stats);
     }
 
     @Override
@@ -367,17 +316,20 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
     {
         StringBuilder sb = new StringBuilder();
 
-        sb.append(String.format("[%s.%s] key=%s columns=%s",
-                                metadata.ksName,
-                                metadata.cfName,
-                                metadata.getKeyValidator().getString(partitionKey().getKey()),
-                                columns));
+        sb.append(String.format("[%s] key=%s partition_deletion=%s columns=%s",
+                                metadata(),
+                                metadata().partitionKeyType.getString(partitionKey().getKey()),
+                                partitionLevelDeletion(),
+                                columns()));
 
         if (staticRow() != Rows.EMPTY_STATIC_ROW)
-            sb.append("\n    ").append(staticRow().toString(metadata));
+            sb.append("\n    ").append(staticRow().toString(metadata(), true));
 
-        for (Row row : this)
-            sb.append("\n    ").append(row.toString(metadata));
+        try (UnfilteredRowIterator iter = unfilteredIterator())
+        {
+            while (iter.hasNext())
+                sb.append("\n    ").append(iter.next().toString(metadata(), true));
+        }
 
         return sb.toString();
     }

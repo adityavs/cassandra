@@ -21,10 +21,10 @@ import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.Iterator;
 
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 
 /**
  * Static methods to work on cells.
@@ -58,9 +58,6 @@ public abstract class Cells
      * Also note that which cell is provided as {@code existing} and which is
      * provided as {@code update} matters for index updates.
      *
-     * @param clustering the clustering for the row the cells to merge originate from.
-     * This is only used for index updates, so this can be {@code null} if
-     * {@code indexUpdater == SecondaryIndexManager.nullUpdater}.
      * @param existing the pre-existing cell, the one that is updated. This can be
      * {@code null} if this reconciliation correspond to an insertion.
      * @param update the newly added cell, the update. This can be {@code null} out
@@ -69,23 +66,14 @@ public abstract class Cells
      * @param deletion the deletion time that applies to the cells being considered.
      * This deletion time may delete both {@code existing} or {@code update}.
      * @param builder the row builder to which the result of the reconciliation is written.
-     * @param nowInSec the current time in seconds (which plays a role during reconciliation
-     * because deleted cells always have precedence on timestamp equality and deciding if a
-     * cell is a live or not depends on the current time due to expiring cells).
-     * @param indexUpdater an index updater to which the result of the reconciliation is
-     * signaled (if relevant, that is if the update is not simply ignored by the reconciliation).
-     * This cannot be {@code null} but {@code SecondaryIndexManager.nullUpdater} can be passed.
      *
      * @return the timestamp delta between existing and update, or {@code Long.MAX_VALUE} if one
      * of them is {@code null} or deleted by {@code deletion}).
      */
-    public static long reconcile(Clustering clustering,
-                                 Cell existing,
+    public static long reconcile(Cell existing,
                                  Cell update,
                                  DeletionTime deletion,
-                                 Row.Builder builder,
-                                 int nowInSec,
-                                 SecondaryIndexManager.Updater indexUpdater)
+                                 Row.Builder builder)
     {
         existing = existing == null || deletion.deletes(existing) ? null : existing;
         update = update == null || deletion.deletes(update) ? null : update;
@@ -93,10 +81,6 @@ public abstract class Cells
         {
             if (update != null)
             {
-                // It's inefficient that we call maybeIndex (which is for primary key indexes) on every cell, but
-                // we'll need to fix that damn 2ndary index API to avoid that.
-                updatePKIndexes(clustering, update, nowInSec, indexUpdater);
-                indexUpdater.insert(clustering, update);
                 builder.addCell(update);
             }
             else if (existing != null)
@@ -106,22 +90,10 @@ public abstract class Cells
             return Long.MAX_VALUE;
         }
 
-        Cell reconciled = reconcile(existing, update, nowInSec);
+        Cell reconciled = reconcile(existing, update);
         builder.addCell(reconciled);
 
-        // Note that this test rely on reconcile returning either 'existing' or 'update'. That's not true for counters but we don't index them
-        if (reconciled == update)
-        {
-            updatePKIndexes(clustering, update, nowInSec, indexUpdater);
-            indexUpdater.update(clustering, existing, reconciled);
-        }
         return Math.abs(existing.timestamp() - update.timestamp());
-    }
-
-    private static void updatePKIndexes(Clustering clustering, Cell cell, int nowInSec, SecondaryIndexManager.Updater indexUpdater)
-    {
-        if (indexUpdater != SecondaryIndexManager.nullUpdater && cell.isLive(nowInSec))
-            indexUpdater.maybeIndex(clustering, cell.timestamp(), cell.ttl(), DeletionTime.LIVE);
     }
 
     /**
@@ -135,59 +107,107 @@ public abstract class Cells
      *
      * @param c1 the first cell participating in the reconciliation.
      * @param c2 the second cell participating in the reconciliation.
-     * @param nowInSec the current time in seconds (which plays a role during reconciliation
-     * because deleted cells always have precedence on timestamp equality and deciding if a
-     * cell is a live or not depends on the current time due to expiring cells).
      *
      * @return a cell corresponding to the reconciliation of {@code c1} and {@code c2}.
      * For non-counter cells, this will always be either {@code c1} or {@code c2}, but for
      * counter cells this can be a newly allocated cell.
      */
-    public static Cell reconcile(Cell c1, Cell c2, int nowInSec)
+    public static Cell reconcile(Cell c1, Cell c2)
     {
-        if (c1 == null)
-            return c2 == null ? null : c2;
-        if (c2 == null)
-            return c1;
+        if (c1 == null || c2 == null)
+            return c2 == null ? c1 : c2;
 
         if (c1.isCounterCell() || c2.isCounterCell())
+            return resolveCounter(c1, c2);
+
+        return resolveRegular(c1, c2);
+    }
+
+    private static Cell resolveRegular(Cell left, Cell right)
+    {
+        long leftTimestamp = left.timestamp();
+        long rightTimestamp = right.timestamp();
+        if (leftTimestamp != rightTimestamp)
+            return leftTimestamp > rightTimestamp ? left : right;
+
+        int leftLocalDeletionTime = left.localDeletionTime();
+        int rightLocalDeletionTime = right.localDeletionTime();
+
+        boolean leftIsExpiringOrTombstone = leftLocalDeletionTime != Cell.NO_DELETION_TIME;
+        boolean rightIsExpiringOrTombstone = rightLocalDeletionTime != Cell.NO_DELETION_TIME;
+
+        if (leftIsExpiringOrTombstone | rightIsExpiringOrTombstone)
         {
-            Conflicts.Resolution res = Conflicts.resolveCounter(c1.timestamp(),
-                                                                c1.isLive(nowInSec),
-                                                                c1.value(),
-                                                                c2.timestamp(),
-                                                                c2.isLive(nowInSec),
-                                                                c2.value());
+            // Tombstones always win reconciliation with live cells of the same timstamp
+            // CASSANDRA-14592: for consistency of reconciliation, regardless of system clock at time of reconciliation
+            // this requires us to treat expiring cells (which will become tombstones at some future date) the same wrt regular cells
+            if (leftIsExpiringOrTombstone != rightIsExpiringOrTombstone)
+                return leftIsExpiringOrTombstone ? left : right;
 
-            switch (res)
-            {
-                case LEFT_WINS: return c1;
-                case RIGHT_WINS: return c2;
-                default:
-                    ByteBuffer merged = Conflicts.mergeCounterValues(c1.value(), c2.value());
-                    long timestamp = Math.max(c1.timestamp(), c2.timestamp());
+            // for most historical consistency, we still prefer tombstones over expiring cells.
+            // While this leads to the an inconsistency over which is chosen
+            // (i.e. before expiry, the pure tombstone; after expiry, whichever is more recent)
+            // this inconsistency has no user-visible distinction, as at this point they are both logically tombstones
+            // (the only possible difference is the time at which the cells become purgeable)
+            boolean leftIsTombstone = !left.isExpiring(); // !isExpiring() == isTombstone(), but does not need to consider localDeletionTime()
+            boolean rightIsTombstone = !right.isExpiring();
+            if (leftIsTombstone != rightIsTombstone)
+                return leftIsTombstone ? left : right;
 
-                    // We save allocating a new cell object if it turns out that one cell was
-                    // a complete superset of the other
-                    if (merged == c1.value() && timestamp == c1.timestamp())
-                        return c1;
-                    else if (merged == c2.value() && timestamp == c2.timestamp())
-                        return c2;
-                    else // merge clocks and timestamps.
-                        return new BufferCell(c1.column(), timestamp, Cell.NO_TTL, Cell.NO_DELETION_TIME, merged, c1.path());
-            }
+            // ==> (leftIsExpiring && rightIsExpiring) or (leftIsTombstone && rightIsTombstone)
+            // if both are expiring, we do not want to consult the value bytes if we can avoid it, as like with C-14592
+            // the value bytes implicitly depend on the system time at reconciliation, as a
+            // would otherwise always win (unless it had an empty value), until it expired and was translated to a tombstone
+            if (leftLocalDeletionTime != rightLocalDeletionTime)
+                return leftLocalDeletionTime > rightLocalDeletionTime ? left : right;
         }
 
-        Conflicts.Resolution res = Conflicts.resolveRegular(c1.timestamp(),
-                                                            c1.isLive(nowInSec),
-                                                            c1.localDeletionTime(),
-                                                            c1.value(),
-                                                            c2.timestamp(),
-                                                            c2.isLive(nowInSec),
-                                                            c2.localDeletionTime(),
-                                                            c2.value());
-        assert res != Conflicts.Resolution.MERGE;
-        return res == Conflicts.Resolution.LEFT_WINS ? c1 : c2;
+        ByteBuffer leftValue = left.value();
+        ByteBuffer rightValue = right.value();
+        return leftValue.compareTo(rightValue) >= 0 ? left : right;
+    }
+
+    private static Cell resolveCounter(Cell left, Cell right)
+    {
+        long leftTimestamp = left.timestamp();
+        long rightTimestamp = right.timestamp();
+
+        boolean leftIsTombstone = left.isTombstone();
+        boolean rightIsTombstone = right.isTombstone();
+
+        if (leftIsTombstone | rightIsTombstone)
+        {
+            // No matter what the counter cell's timestamp is, a tombstone always takes precedence. See CASSANDRA-7346.
+            assert leftIsTombstone != rightIsTombstone;
+            return leftIsTombstone ? left : right;
+        }
+
+        ByteBuffer leftValue = left.value();
+        ByteBuffer rightValue = right.value();
+
+        // Handle empty values. Counters can't truly have empty values, but we can have a counter cell that temporarily
+        // has one on read if the column for the cell is not queried by the user due to the optimization of #10657. We
+        // thus need to handle this (see #11726 too).
+        boolean leftIsEmpty = !leftValue.hasRemaining();
+        boolean rightIsEmpty = !rightValue.hasRemaining();
+        if (leftIsEmpty || rightIsEmpty)
+        {
+            if (leftIsEmpty != rightIsEmpty)
+                return leftIsEmpty ? left : right;
+            return leftTimestamp > rightTimestamp ? left : right;
+        }
+
+        ByteBuffer merged = CounterContext.instance().merge(leftValue, rightValue);
+        long timestamp = Math.max(leftTimestamp, rightTimestamp);
+
+        // We save allocating a new cell object if it turns out that one cell was
+        // a complete superset of the other
+        if (merged == leftValue && timestamp == leftTimestamp)
+            return left;
+        else if (merged == rightValue && timestamp == rightTimestamp)
+            return right;
+        else // merge clocks and timestamps.
+            return new BufferCell(left.column(), timestamp, Cell.NO_TTL, Cell.NO_DELETION_TIME, merged, left.path());
     }
 
     /**
@@ -202,9 +222,6 @@ public abstract class Cells
      * Also note that which cells is provided as {@code existing} and which are
      * provided as {@code update} matters for index updates.
      *
-     * @param clustering the clustering for the row the cells to merge originate from.
-     * This is only used for index updates, so this can be {@code null} if
-     * {@code indexUpdater == SecondaryIndexManager.nullUpdater}.
      * @param column the complex column the cells are for.
      * @param existing the pre-existing cells, the ones that are updated. This can be
      * {@code null} if this reconciliation correspond to an insertion.
@@ -214,12 +231,6 @@ public abstract class Cells
      * @param deletion the deletion time that applies to the cells being considered.
      * This deletion time may delete cells in both {@code existing} and {@code update}.
      * @param builder the row build to which the result of the reconciliation is written.
-     * @param nowInSec the current time in seconds (which plays a role during reconciliation
-     * because deleted cells always have precedence on timestamp equality and deciding if a
-     * cell is a live or not depends on the current time due to expiring cells).
-     * @param indexUpdater an index updater to which the result of the reconciliation is
-     * signaled (if relevant, that is if the updates are not simply ignored by the reconciliation).
-     * This cannot be {@code null} but {@code SecondaryIndexManager.nullUpdater} can be passed.
      *
      * @return the smallest timestamp delta between corresponding cells from existing and update. A
      * timestamp delta being computed as the difference between a cell from {@code update} and the
@@ -227,14 +238,11 @@ public abstract class Cells
      * of cells from {@code existing} and {@code update} having the same cell path is empty, this
      * returns {@code Long.MAX_VALUE}.
      */
-    public static long reconcileComplex(Clustering clustering,
-                                        ColumnDefinition column,
+    public static long reconcileComplex(ColumnMetadata column,
                                         Iterator<Cell> existing,
                                         Iterator<Cell> update,
                                         DeletionTime deletion,
-                                        Row.Builder builder,
-                                        int nowInSec,
-                                        SecondaryIndexManager.Updater indexUpdater)
+                                        Row.Builder builder)
     {
         Comparator<CellPath> comparator = column.cellPathComparator();
         Cell nextExisting = getNext(existing);
@@ -247,22 +255,94 @@ public abstract class Cells
                      : comparator.compare(nextExisting.path(), nextUpdate.path()));
             if (cmp < 0)
             {
-                reconcile(clustering, nextExisting, null, deletion, builder, nowInSec, indexUpdater);
+                reconcile(nextExisting, null, deletion, builder);
                 nextExisting = getNext(existing);
             }
             else if (cmp > 0)
             {
-                reconcile(clustering, null, nextUpdate, deletion, builder, nowInSec, indexUpdater);
+                reconcile(null, nextUpdate, deletion, builder);
                 nextUpdate = getNext(update);
             }
             else
             {
-                timeDelta = Math.min(timeDelta, reconcile(clustering, nextExisting, nextUpdate, deletion, builder, nowInSec, indexUpdater));
+                timeDelta = Math.min(timeDelta, reconcile(nextExisting, nextUpdate, deletion, builder));
                 nextExisting = getNext(existing);
                 nextUpdate = getNext(update);
             }
         }
         return timeDelta;
+    }
+
+    /**
+     * Adds to the builder a representation of the given existing cell that, when merged/reconciled with the given
+     * update cell, produces the same result as merging the original with the update.
+     * <p>
+     * For simple cells that is either the original cell (if still live), or nothing (if shadowed).
+     *
+     * @param existing the pre-existing cell, the one that is updated.
+     * @param update the newly added cell, the update. This can be {@code null} out
+     * of convenience, in which case this function simply copy {@code existing} to
+     * {@code writer}.
+     * @param deletion the deletion time that applies to the cells being considered.
+     * This deletion time may delete both {@code existing} or {@code update}.
+     * @param builder the row builder to which the result of the filtering is written.
+     */
+    public static void addNonShadowed(Cell existing,
+                                      Cell update,
+                                      DeletionTime deletion,
+                                      Row.Builder builder)
+    {
+        if (deletion.deletes(existing))
+            return;
+
+        Cell reconciled = reconcile(existing, update);
+        if (reconciled != update)
+            builder.addCell(existing);
+    }
+
+    /**
+     * Adds to the builder a representation of the given existing cell that, when merged/reconciled with the given
+     * update cell, produces the same result as merging the original with the update.
+     * <p>
+     * For simple cells that is either the original cell (if still live), or nothing (if shadowed).
+     *
+     * @param column the complex column the cells are for.
+     * @param existing the pre-existing cells, the ones that are updated.
+     * @param update the newly added cells, the update. This can be {@code null} out
+     * of convenience, in which case this function simply copy the cells from
+     * {@code existing} to {@code writer}.
+     * @param deletion the deletion time that applies to the cells being considered.
+     * This deletion time may delete both {@code existing} or {@code update}.
+     * @param builder the row builder to which the result of the filtering is written.
+     */
+    public static void addNonShadowedComplex(ColumnMetadata column,
+                                             Iterator<Cell> existing,
+                                             Iterator<Cell> update,
+                                             DeletionTime deletion,
+                                             Row.Builder builder)
+    {
+        Comparator<CellPath> comparator = column.cellPathComparator();
+        Cell nextExisting = getNext(existing);
+        Cell nextUpdate = getNext(update);
+        while (nextExisting != null)
+        {
+            int cmp = nextUpdate == null ? -1 : comparator.compare(nextExisting.path(), nextUpdate.path());
+            if (cmp < 0)
+            {
+                addNonShadowed(nextExisting, null, deletion, builder);
+                nextExisting = getNext(existing);
+            }
+            else if (cmp == 0)
+            {
+                addNonShadowed(nextExisting, nextUpdate, deletion, builder);
+                nextExisting = getNext(existing);
+                nextUpdate = getNext(update);
+            }
+            else
+            {
+                nextUpdate = getNext(update);
+            }
+        }
     }
 
     private static Cell getNext(Iterator<Cell> iterator)

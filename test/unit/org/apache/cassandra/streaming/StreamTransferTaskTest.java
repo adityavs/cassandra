@@ -17,26 +17,36 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.BeforeClass;
+import org.junit.After;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import io.netty.channel.embedded.EmbeddedChannel;
+import org.junit.Assert;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.streaming.CassandraOutgoingFile;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.streaming.messages.OutgoingStreamMessage;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -55,30 +65,34 @@ public class StreamTransferTaskTest
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD));
     }
 
+    @After
+    public void tearDown()
+    {
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD);
+        cfs.clearUnsafe();
+    }
+
     @Test
     public void testScheduleTimeout() throws Exception
     {
-        String ks = KEYSPACE1;
-        String cf = "Standard1";
-
-        InetAddress peer = FBUtilities.getBroadcastAddress();
-        StreamSession session = new StreamSession(peer, peer, null, 0, true, false);
-        ColumnFamilyStore cfs = Keyspace.open(ks).getColumnFamilyStore(cf);
+        InetAddressAndPort peer = FBUtilities.getBroadcastAddressAndPort();
+        StreamSession session = new StreamSession(StreamOperation.BOOTSTRAP, peer, (connectionId, protocolVersion) -> new EmbeddedChannel(), 0, UUID.randomUUID(), PreviewKind.ALL);
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD);
 
         // create two sstables
         for (int i = 0; i < 2; i++)
         {
-            SchemaLoader.insertData(ks, cf, i, 1);
+            SchemaLoader.insertData(KEYSPACE1, CF_STANDARD, i, 1);
             cfs.forceBlockingFlush();
         }
 
         // create streaming task that streams those two sstables
-        StreamTransferTask task = new StreamTransferTask(session, cfs.metadata.cfId);
+        StreamTransferTask task = new StreamTransferTask(session, cfs.metadata.id);
         for (SSTableReader sstable : cfs.getLiveSSTables())
         {
             List<Range<Token>> ranges = new ArrayList<>();
             ranges.add(new Range<>(sstable.first.getToken(), sstable.last.getToken()));
-            task.addTransferFile(sstable.selfRef(), 1, sstable.getPositionsForRanges(ranges), 0);
+            task.addTransferStream(new CassandraOutgoingFile(StreamOperation.BOOTSTRAP, sstable.selfRef(), sstable.getPositionsForRanges(ranges), ranges, 1));
         }
         assertEquals(2, task.getTotalNumberOfFiles());
 
@@ -102,5 +116,69 @@ public class StreamTransferTaskTest
 
         // when all streaming are done, time out task should not be scheduled.
         assertNull(task.scheduleTimeout(1, 1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    public void testFailSessionDuringTransferShouldNotReleaseReferences() throws Exception
+    {
+        InetAddressAndPort peer = FBUtilities.getBroadcastAddressAndPort();
+        StreamCoordinator streamCoordinator = new StreamCoordinator(StreamOperation.BOOTSTRAP, 1, new DefaultConnectionFactory(), false, null, PreviewKind.NONE);
+        StreamResultFuture future = StreamResultFuture.init(UUID.randomUUID(), StreamOperation.OTHER, Collections.<StreamEventHandler>emptyList(), streamCoordinator);
+        StreamSession session = new StreamSession(StreamOperation.BOOTSTRAP, peer, null, 0, null, PreviewKind.NONE);
+        session.init(future);
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD);
+
+        // create two sstables
+        for (int i = 0; i < 2; i++)
+        {
+            SchemaLoader.insertData(KEYSPACE1, CF_STANDARD, i, 1);
+            cfs.forceBlockingFlush();
+        }
+
+        // create streaming task that streams those two sstables
+        StreamTransferTask task = new StreamTransferTask(session, cfs.metadata.id);
+        List<Ref<SSTableReader>> refs = new ArrayList<>(cfs.getLiveSSTables().size());
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            List<Range<Token>> ranges = new ArrayList<>();
+            ranges.add(new Range<>(sstable.first.getToken(), sstable.last.getToken()));
+            Ref<SSTableReader> ref = sstable.selfRef();
+            refs.add(ref);
+            task.addTransferStream(new CassandraOutgoingFile(StreamOperation.BOOTSTRAP, ref, sstable.getPositionsForRanges(ranges), ranges, 1));
+        }
+        assertEquals(2, task.getTotalNumberOfFiles());
+
+        //add task to stream session, so it is aborted when stream session fails
+        session.transfers.put(TableId.generate(), task);
+
+        //make a copy of outgoing file messages, since task is cleared when it's aborted
+        Collection<OutgoingStreamMessage> files = new LinkedList<>(task.streams.values());
+
+        //simulate start transfer
+        for (OutgoingStreamMessage file : files)
+        {
+            file.startTransfer();
+        }
+
+        //fail stream session mid-transfer
+        session.onError(new Exception("Fake exception")).get(5, TimeUnit.SECONDS);
+
+        //make sure reference was not released
+        for (Ref<SSTableReader> ref : refs)
+        {
+            assertEquals(1, ref.globalCount());
+        }
+
+        //simulate finish transfer
+        for (OutgoingStreamMessage file : files)
+        {
+            file.finishTransfer();
+        }
+
+        //now reference should be released
+        for (Ref<SSTableReader> ref : refs)
+        {
+            assertEquals(0, ref.globalCount());
+        }
     }
 }

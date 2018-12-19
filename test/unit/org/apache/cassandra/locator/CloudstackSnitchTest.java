@@ -19,7 +19,7 @@
 package org.apache.cassandra.locator;
 
 import java.io.IOException;
-import java.net.InetAddress;
+import java.util.EnumMap;
 import java.util.Map;
 
 import org.junit.AfterClass;
@@ -27,6 +27,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
@@ -43,6 +44,7 @@ public class CloudstackSnitchTest
     @BeforeClass
     public static void setup() throws Exception
     {
+        DatabaseDescriptor.daemonInitialization();
         SchemaLoader.mkdirs();
         SchemaLoader.cleanup();
         Keyspace.setInitialized();
@@ -74,13 +76,14 @@ public class CloudstackSnitchTest
     {
         az = "ch-gva-1";
         CloudstackSnitch snitch = new TestCloudstackSnitch();
-        InetAddress local = InetAddress.getByName("127.0.0.1");
-        InetAddress nonlocal = InetAddress.getByName("127.0.0.7");
+        InetAddressAndPort local = InetAddressAndPort.getByName("127.0.0.1");
+        InetAddressAndPort nonlocal = InetAddressAndPort.getByName("127.0.0.7");
 
         Gossiper.instance.addSavedEndpoint(nonlocal);
-        Map<ApplicationState,VersionedValue> stateMap = Gossiper.instance.getEndpointStateForEndpoint(nonlocal).getApplicationStateMap();
+        Map<ApplicationState, VersionedValue> stateMap = new EnumMap<>(ApplicationState.class);
         stateMap.put(ApplicationState.DC, StorageService.instance.valueFactory.datacenter("ch-zrh"));
         stateMap.put(ApplicationState.RACK, StorageService.instance.valueFactory.rack("2"));
+        Gossiper.instance.getEndpointStateForEndpoint(nonlocal).addApplicationStates(stateMap);
 
         assertEquals("ch-zrh", snitch.getDatacenter(nonlocal));
         assertEquals("2", snitch.getRack(nonlocal));
@@ -95,7 +98,7 @@ public class CloudstackSnitchTest
     {
         az = "ch-gva-1";
         CloudstackSnitch snitch = new TestCloudstackSnitch();
-        InetAddress local = InetAddress.getByName("127.0.0.1");
+        InetAddressAndPort local = InetAddressAndPort.getByName("127.0.0.1");
 
         assertEquals("ch-gva", snitch.getDatacenter(local));
         assertEquals("1", snitch.getRack(local));

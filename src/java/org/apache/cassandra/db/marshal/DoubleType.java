@@ -25,20 +25,27 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.DoubleSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class DoubleType extends AbstractType<Double>
+public class DoubleType extends NumberType<Double>
 {
     public static final DoubleType instance = new DoubleType();
 
-    DoubleType() {} // singleton
+    DoubleType() {super(ComparisonType.CUSTOM);} // singleton
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    @Override
+    public boolean isFloatingPoint()
+    {
+        return true;
+    }
+
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
     {
         if (!o1.hasRemaining() || !o2.hasRemaining())
             return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
@@ -52,17 +59,14 @@ public class DoubleType extends AbstractType<Double>
       if (source.isEmpty())
           return ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
-      Double d;
       try
       {
-          d = Double.valueOf(source);
+          return decompose(Double.valueOf(source));
       }
       catch (NumberFormatException e1)
       {
           throw new MarshalException(String.format("Unable to make double from '%s'", source), e1);
       }
-
-      return decompose(d);
     }
 
     @Override
@@ -83,9 +87,13 @@ public class DoubleType extends AbstractType<Double>
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        return getSerializer().deserialize(buffer).toString();
+        Double value = getSerializer().deserialize(buffer);
+        // JSON does not support NaN, Infinity and -Infinity values. Most of the parser convert them into null.
+        if (value.isNaN() || value.isInfinite())
+            return "null";
+        return value.toString();
     }
 
     public CQL3Type asCQL3Type()
@@ -99,8 +107,62 @@ public class DoubleType extends AbstractType<Double>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public int valueLengthIfFixed()
     {
         return 8;
+    }
+
+    @Override
+    protected int toInt(ByteBuffer value)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected float toFloat(ByteBuffer value)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected long toLong(ByteBuffer value)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected double toDouble(ByteBuffer value)
+    {
+        return ByteBufferUtil.toDouble(value);
+    }
+
+    public ByteBuffer add(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toDouble(left) + rightType.toDouble(right));
+    }
+
+    public ByteBuffer substract(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toDouble(left) - rightType.toDouble(right));
+    }
+
+    public ByteBuffer multiply(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toDouble(left) * rightType.toDouble(right));
+    }
+
+    public ByteBuffer divide(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toDouble(left) / rightType.toDouble(right));
+    }
+
+    public ByteBuffer mod(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toDouble(left) % rightType.toDouble(right));
+    }
+
+    public ByteBuffer negate(ByteBuffer input)
+    {
+        return ByteBufferUtil.bytes(-toDouble(input));
     }
 }

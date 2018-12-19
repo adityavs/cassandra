@@ -21,22 +21,23 @@ package org.apache.cassandra.utils.memory;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.Queue;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
-import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.io.compress.BufferType;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.NoSpamLogger;
-
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.cassandra.concurrent.InfiniteLoopExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.BufferPoolMetrics;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.concurrent.Ref;
 
 /**
@@ -44,8 +45,8 @@ import org.apache.cassandra.utils.concurrent.Ref;
  */
 public class BufferPool
 {
-    /** The size of a page aligned buffer, 64kbit */
-    static final int CHUNK_SIZE = 64 << 10;
+    /** The size of a page aligned buffer, 64KiB */
+    public static final int CHUNK_SIZE = 64 << 10;
 
     @VisibleForTesting
     public static long MEMORY_USAGE_THRESHOLD = DatabaseDescriptor.getFileCacheSizeInMB() * 1024L * 1024L;
@@ -67,7 +68,8 @@ public class BufferPool
     private static final GlobalPool globalPool = new GlobalPool();
 
     /** A thread local pool of chunks, where chunks come from the global pool */
-    private static final ThreadLocal<LocalPool> localPool = new ThreadLocal<LocalPool>() {
+    private static final FastThreadLocal<LocalPool> localPool = new FastThreadLocal<LocalPool>()
+    {
         @Override
         protected LocalPool initialValue()
         {
@@ -115,7 +117,7 @@ public class BufferPool
             return ret;
 
         if (logger.isTraceEnabled())
-            logger.trace("Requested buffer size {} has been allocated directly due to lack of capacity", size);
+            logger.trace("Requested buffer size {} has been allocated directly due to lack of capacity", FBUtilities.prettyPrintMemory(size));
 
         return localPool.get().allocate(size, allocateOnHeapWhenExhausted);
     }
@@ -131,7 +133,9 @@ public class BufferPool
         if (size > CHUNK_SIZE)
         {
             if (logger.isTraceEnabled())
-                logger.trace("Requested buffer size {} is bigger than {}, allocating directly", size, CHUNK_SIZE);
+                logger.trace("Requested buffer size {} is bigger than {}, allocating directly",
+                             FBUtilities.prettyPrintMemory(size),
+                             FBUtilities.prettyPrintMemory(CHUNK_SIZE));
 
             return localPool.get().allocate(size, allocateOnHeapWhenExhausted);
         }
@@ -223,8 +227,8 @@ public class BufferPool
             if (DISABLED)
                 logger.info("Global buffer pool is disabled, allocating {}", ALLOCATE_ON_HEAP_WHEN_EXAHUSTED ? "on heap" : "off heap");
             else
-                logger.info("Global buffer pool is enabled, when pool is exahusted (max is {} mb) it will allocate {}",
-                            MEMORY_USAGE_THRESHOLD / (1024L * 1024L),
+                logger.info("Global buffer pool is enabled, when pool is exhausted (max is {}) it will allocate {}",
+                            FBUtilities.prettyPrintMemory(MEMORY_USAGE_THRESHOLD),
                             ALLOCATE_ON_HEAP_WHEN_EXAHUSTED ? "on heap" : "off heap");
         }
 
@@ -237,50 +241,66 @@ public class BufferPool
         /** Return a chunk, the caller will take owership of the parent chunk. */
         public Chunk get()
         {
-            while (true)
-            {
-                Chunk chunk = chunks.poll();
-                if (chunk != null)
-                    return chunk;
+            Chunk chunk = chunks.poll();
+            if (chunk != null)
+                return chunk;
 
-                if (!allocateMoreChunks())
-                    // give it one last attempt, in case someone else allocated before us
-                    return chunks.poll();
-            }
+            chunk = allocateMoreChunks();
+            if (chunk != null)
+                return chunk;
+
+            // another thread may have just allocated last macro chunk, so make one final attempt before returning null
+            return chunks.poll();
         }
 
         /**
          * This method might be called by multiple threads and that's fine if we add more
          * than one chunk at the same time as long as we don't exceed the MEMORY_USAGE_THRESHOLD.
          */
-        private boolean allocateMoreChunks()
+        private Chunk allocateMoreChunks()
         {
             while (true)
             {
                 long cur = memoryUsage.get();
                 if (cur + MACRO_CHUNK_SIZE > MEMORY_USAGE_THRESHOLD)
                 {
-                    noSpamLogger.info("Maximum memory usage reached ({} bytes), cannot allocate chunk of {} bytes",
+                    noSpamLogger.info("Maximum memory usage reached ({}), cannot allocate chunk of {}",
                                       MEMORY_USAGE_THRESHOLD, MACRO_CHUNK_SIZE);
-                    return false;
+                    return null;
                 }
                 if (memoryUsage.compareAndSet(cur, cur + MACRO_CHUNK_SIZE))
                     break;
             }
 
             // allocate a large chunk
-            Chunk chunk = new Chunk(allocateDirectAligned(MACRO_CHUNK_SIZE));
+            Chunk chunk;
+            try
+            {
+                chunk = new Chunk(allocateDirectAligned(MACRO_CHUNK_SIZE));
+            }
+            catch (OutOfMemoryError oom)
+            {
+                noSpamLogger.error("Buffer pool failed to allocate chunk of {}, current size {} ({}). " +
+                                   "Attempting to continue; buffers will be allocated in on-heap memory which can degrade performance. " +
+                                   "Make sure direct memory size (-XX:MaxDirectMemorySize) is large enough to accommodate off-heap memtables and caches.",
+                                   MACRO_CHUNK_SIZE, sizeInBytes(), oom.toString());
+                return null;
+            }
+
             chunk.acquire(null);
             macroChunks.add(chunk);
-            for (int i = 0 ; i < MACRO_CHUNK_SIZE ; i += CHUNK_SIZE)
+
+            final Chunk callerChunk = new Chunk(chunk.get(CHUNK_SIZE));
+            if (DEBUG)
+                debug.register(callerChunk);
+            for (int i = CHUNK_SIZE ; i < MACRO_CHUNK_SIZE; i += CHUNK_SIZE)
             {
                 Chunk add = new Chunk(chunk.get(CHUNK_SIZE));
                 chunks.add(add);
                 if (DEBUG)
                     debug.register(add);
             }
-
-            return true;
+            return callerChunk;
         }
 
         public void recycle(Chunk chunk)
@@ -476,34 +496,16 @@ public class BufferPool
     private static final ConcurrentLinkedQueue<LocalPoolRef> localPoolReferences = new ConcurrentLinkedQueue<>();
 
     private static final ReferenceQueue<Object> localPoolRefQueue = new ReferenceQueue<>();
-    private static final ExecutorService EXEC = Executors.newFixedThreadPool(1, new NamedThreadFactory("LocalPool-Cleaner"));
-    static
+    private static final InfiniteLoopExecutor EXEC = new InfiniteLoopExecutor("LocalPool-Cleaner", BufferPool::cleanupOneReference).start();
+
+    private static void cleanupOneReference() throws InterruptedException
     {
-        EXEC.execute(new Runnable()
+        Object obj = localPoolRefQueue.remove(100);
+        if (obj instanceof LocalPoolRef)
         {
-            public void run()
-            {
-                try
-                {
-                    while (true)
-                    {
-                        Object obj = localPoolRefQueue.remove();
-                        if (obj instanceof LocalPoolRef)
-                        {
-                            ((LocalPoolRef) obj).release();
-                            localPoolReferences.remove(obj);
-                        }
-                    }
-                }
-                catch (InterruptedException e)
-                {
-                }
-                finally
-                {
-                    EXEC.execute(this);
-                }
-            }
-        });
+            ((LocalPoolRef) obj).release();
+            localPoolReferences.remove(obj);
+        }
     }
 
     private static ByteBuffer allocateDirectAligned(int capacity)
@@ -854,5 +856,12 @@ public class BufferPool
     {
         int mask = unit - 1;
         return (size + mask) & ~mask;
+    }
+
+    @VisibleForTesting
+    public static void shutdownLocalCleaner() throws InterruptedException
+    {
+        EXEC.shutdown();
+        EXEC.awaitTermination(60, TimeUnit.SECONDS);
     }
 }

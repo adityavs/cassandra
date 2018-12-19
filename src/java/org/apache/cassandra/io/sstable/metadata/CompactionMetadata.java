@@ -72,24 +72,20 @@ public class CompactionMetadata extends MetadataComponent
 
     public static class CompactionMetadataSerializer implements IMetadataComponentSerializer<CompactionMetadata>
     {
-        public int serializedSize(CompactionMetadata component) throws IOException
+        public int serializedSize(Version version, CompactionMetadata component) throws IOException
         {
+            int sz = 0;
             byte[] serializedCardinality = component.cardinalityEstimator.getBytes();
-            return TypeSizes.sizeof(serializedCardinality.length) + serializedCardinality.length;
+            return TypeSizes.sizeof(serializedCardinality.length) + serializedCardinality.length + sz;
         }
 
-        public void serialize(CompactionMetadata component, DataOutputPlus out) throws IOException
+        public void serialize(Version version, CompactionMetadata component, DataOutputPlus out) throws IOException
         {
             ByteBufferUtil.writeWithLength(component.cardinalityEstimator.getBytes(), out);
         }
 
         public CompactionMetadata deserialize(Version version, DataInputPlus in) throws IOException
         {
-            if (version.hasCompactionAncestors())
-            { // skip ancestors
-                int nbAncestors = in.readInt();
-                in.skipBytes(nbAncestors * TypeSizes.sizeof(nbAncestors));
-            }
             ICardinality cardinality = HyperLogLogPlus.Builder.build(ByteBufferUtil.readBytes(in, in.readInt()));
             return new CompactionMetadata(cardinality);
         }

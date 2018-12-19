@@ -24,11 +24,9 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.WritableByteChannel;
 
-import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
 
 import net.nicoulaj.compilecommand.annotations.DontInline;
-
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.utils.memory.MemoryUtil;
 import org.apache.cassandra.utils.vint.VIntCoding;
@@ -129,7 +127,7 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
             }
             else
             {
-                doFlush();
+                doFlush(len - copied);
             }
         }
     }
@@ -154,8 +152,9 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
         {
             assert toWrite.isDirect();
             MemoryUtil.duplicateDirectByteBuffer(toWrite, hollowBuffer);
+            int toWriteRemaining = toWrite.remaining();
 
-            if (toWrite.remaining() > buffer.remaining())
+            if (toWriteRemaining > buffer.remaining())
             {
                 if (strictFlushing)
                 {
@@ -163,7 +162,7 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
                 }
                 else
                 {
-                    doFlush();
+                    doFlush(toWriteRemaining - buffer.remaining());
                     while (hollowBuffer.remaining() > buffer.capacity())
                         channel.write(hollowBuffer);
                 }
@@ -182,7 +181,7 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
         {
             hollowBuffer.limit(hollowBuffer.position() + buffer.remaining());
             buffer.put(hollowBuffer);
-            doFlush();
+            doFlush(originalLimit - hollowBuffer.position());
         }
         hollowBuffer.limit(originalLimit);
     }
@@ -191,7 +190,7 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
     public void write(int b) throws IOException
     {
         if (!buffer.hasRemaining())
-            doFlush();
+            doFlush(1);
         buffer.put((byte) (b & 0xFF));
     }
 
@@ -199,7 +198,7 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
     public void writeBoolean(boolean v) throws IOException
     {
         if (!buffer.hasRemaining())
-            doFlush();
+            doFlush(1);
         buffer.put(v ? (byte)1 : (byte)0);
     }
 
@@ -310,8 +309,11 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
             write(buffer);
     }
 
+    /*
+     * Count is the number of bytes remaining to write ignoring already remaining capacity
+     */
     @DontInline
-    protected void doFlush() throws IOException
+    protected void doFlush(int count) throws IOException
     {
         buffer.flip();
 
@@ -324,20 +326,20 @@ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus
     @Override
     public void flush() throws IOException
     {
-        doFlush();
+        doFlush(0);
     }
 
     @Override
     public void close() throws IOException
     {
-        doFlush();
+        doFlush(0);
         channel.close();
         FileUtils.clean(buffer);
         buffer = null;
     }
 
     @Override
-    public <R> R applyToChannel(Function<WritableByteChannel, R> f) throws IOException
+    public <R> R applyToChannel(CheckedFunction<WritableByteChannel, R, IOException> f) throws IOException
     {
         if (strictFlushing)
             throw new UnsupportedOperationException();

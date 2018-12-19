@@ -18,46 +18,63 @@
  */
 package org.apache.cassandra.net;
 
-import java.net.InetAddress;
-
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.utils.FBUtilities;
 
 public class WriteCallbackInfo extends CallbackInfo
 {
-    private final MessageOut sentMessage;
-    private final ConsistencyLevel consistencyLevel;
-    private final boolean allowHints;
+    // either a Mutation, or a Paxos Commit (MessageOut)
+    private final Object mutation;
+    private final Replica replica;
 
-    public WriteCallbackInfo(InetAddress target,
+    public WriteCallbackInfo(Replica replica,
                              IAsyncCallback callback,
                              MessageOut message,
                              IVersionedSerializer<?> serializer,
                              ConsistencyLevel consistencyLevel,
                              boolean allowHints)
     {
-        super(target, callback, serializer, true);
+        super(replica.endpoint(), callback, serializer, true);
         assert message != null;
-        this.sentMessage = message;
-        this.consistencyLevel = consistencyLevel;
-        this.allowHints = allowHints;
-    }
-
-    Mutation mutation()
-    {
-        return sentMessage.verb == MessagingService.Verb.PAXOS_COMMIT
-             ? ((Commit) sentMessage.payload).makeMutation()
-             : (Mutation) sentMessage.payload;
+        this.mutation = shouldHint(allowHints, message, consistencyLevel);
+        //Local writes shouldn't go through messaging service (https://issues.apache.org/jira/browse/CASSANDRA-10477)
+        assert (!target.equals(FBUtilities.getBroadcastAddressAndPort()));
+        this.replica = replica;
     }
 
     public boolean shouldHint()
     {
-        return allowHints
-            && sentMessage.verb != MessagingService.Verb.COUNTER_MUTATION
-            && consistencyLevel != ConsistencyLevel.ANY
-            && StorageProxy.shouldHint(target);
+        return mutation != null && StorageProxy.shouldHint(replica);
     }
+
+    public Replica getReplica()
+    {
+        return replica;
+    }
+
+    public Mutation mutation()
+    {
+        return getMutation(mutation);
+    }
+
+    private static Mutation getMutation(Object object)
+    {
+        assert object instanceof Commit || object instanceof Mutation : object;
+        return object instanceof Commit ? ((Commit) object).makeMutation()
+                                        : (Mutation) object;
+    }
+
+    private static Object shouldHint(boolean allowHints, MessageOut sentMessage, ConsistencyLevel consistencyLevel)
+    {
+        return allowHints
+               && sentMessage.verb != MessagingService.Verb.COUNTER_MUTATION
+               && consistencyLevel != ConsistencyLevel.ANY
+               ? sentMessage.payload : null;
+    }
+
 }

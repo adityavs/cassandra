@@ -24,8 +24,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import org.junit.Test;
 
-import junit.framework.Assert;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.junit.Assert;
 
 public class SerializationMirrorTest extends CQLTester
 {

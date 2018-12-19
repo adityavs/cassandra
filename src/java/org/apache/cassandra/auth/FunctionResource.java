@@ -28,12 +28,13 @@ import com.google.common.base.Splitter;
 import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.functions.FunctionName;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.TypeParser;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 
 /**
  * IResource implementation representing functions.
@@ -133,6 +134,11 @@ public class FunctionResource implements IResource
         return new FunctionResource(keyspace, name, argTypes);
     }
 
+    public static FunctionResource function(Function function)
+    {
+        return new FunctionResource(function.name().keyspace, function.name().name, function.argTypes());
+    }
+
     /**
      * Creates a FunctionResource representing a specific, keyspace-scoped function.
      * This variant is used to create an instance during parsing of a CQL statement.
@@ -146,11 +152,19 @@ public class FunctionResource implements IResource
      */
     public static FunctionResource functionFromCql(String keyspace, String name, List<CQL3Type.Raw> argTypes)
     {
-        List<AbstractType<?>> abstractTypes = new ArrayList<>();
+        if (keyspace == null)
+            throw new InvalidRequestException("In this context function name must be " +
+                                              "explictly qualified by a keyspace");
+        List<AbstractType<?>> abstractTypes = new ArrayList<>(argTypes.size());
         for (CQL3Type.Raw cqlType : argTypes)
             abstractTypes.add(cqlType.prepare(keyspace).getType());
 
         return new FunctionResource(keyspace, name, abstractTypes);
+    }
+
+    public static FunctionResource functionFromCql(FunctionName name, List<CQL3Type.Raw> argTypes)
+    {
+        return functionFromCql(name.keyspace, name.name, argTypes);
     }
 
     /**
